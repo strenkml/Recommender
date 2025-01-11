@@ -7,3 +7,5 @@ Coming soon. Quasi functional model but fighting with NLP for understanding "the
 Example. While lots of things are in action / drama, I want it to understand that Yellowstone is like 1883 which is like Landman (Temporal and semetic connections)
 
 {Internal screaming}
+
+The final hope is a GUI based app that allows you to just run it, no need to do a bunch of fancy crap on your side, just fill in the basic config and run it.
