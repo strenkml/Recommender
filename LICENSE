@@ -672,3 +672,14 @@ may consider it more useful to permit linking proprietary applications with
 the library.  If this is what you want to do, use the GNU Lesser General
 Public License instead of this License.  But first, please read
 <https://www.gnu.org/licenses/why-not-lgpl.html>.
+
+This project is licensed under the GNU General Public License v3.0 (GPL-3.0) with the following additional terms:
+
+1. Attribution Requirement:
+   Any derivative work must provide proper citation to the original project and include clear credit to the original authors.
+
+2. Non-Commercial Use:
+   The project and all derivative works may not be used, modified, or distributed for commercial purposes.
+
+For full terms, refer to the LICENSE file and the additional terms above.
+
