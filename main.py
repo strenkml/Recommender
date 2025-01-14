@@ -1088,7 +1088,7 @@ class MediaRecommenderApp(QMainWindow):
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logging.INFO)
         temp_dir = tempfile.gettempdir()
-        log_file_path = os.path.join(temp_dir, 'plex_recommender.log')
+        log_file_path = os.path.join(temp_dir, 'recommend_for_plex.log')
         log_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         log_handler = RotatingFileHandler(log_file_path, maxBytes=10*1024*1024, backupCount=5)
         log_handler.setFormatter(log_formatter)
