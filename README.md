@@ -1,6 +1,6 @@
 # Plex Recommend 
 
-This is a comprehensive recommendation system that integrates with Plex, TMDB, and TVDB to provide movie and TV show recommendations. It uses PyQt5 for the GUI, several PyTorch-based encoders and neural networks for generating embeddings, a knowledge graph for content relationships, and an SQLite database for storing media items, embeddings, preferences, and feedback.
+This is a comprehensive recommendation system that integrates with Plex, TMDB, and TVDB to provide movie and TV show recommendations. It uses PySide6 for the GUI, several PyTorch-based encoders and neural networks for generating embeddings, a knowledge graph for content relationships, and an SQLite database for storing media items, embeddings, preferences, and feedback.
 
 This is designed to be very good at learning, but still light enough to run on a laptop using only CPU.
 
@@ -54,7 +54,7 @@ This application is designed to recommend movies and TV shows to users. It lever
 - **TMDB** (The Movie Database): For enhanced metadata on movies and TV series.
 - **TVDB** (TheTVDB): For extended TV series data, especially episodes.
 
-The application uses a PyQt5 interface, enabling you to configure keys, Plex server details, select libraries, scan them, and start receiving recommendations. You can rate items from 1 to 10, and the system will adapt its recommendations over time.
+The application uses a PySide6 interface, enabling you to configure keys, Plex server details, select libraries, scan them, and start receiving recommendations. You can rate items from 1 to 10, and the system will adapt its recommendations over time.
 
 ---
 
@@ -88,7 +88,7 @@ Install dependencies in a virtual environment (recommended). For example:
     pip install -r requirements.txt
 
 If you do not have a `requirements.txt`, here is a non-exhaustive list of the major libraries needed:
-- PyQt5
+- PySide6
 - requests
 - aiohttp
 - sqlite3 (built-in in Python, but note usage details)
@@ -115,7 +115,7 @@ Note: Depending on your environment, some additional PyTorch Geometric dependenc
     
        python -m main
     
-4. The PyQt5 UI should appear shortly.
+4. The PySide6 UI should appear shortly.
 
 ---
 
