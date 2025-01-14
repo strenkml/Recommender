@@ -64,7 +64,7 @@ class Database:
 
     def _connect(self):
         try:
-            self.conn = sqlite3.connect('media_recommender.db', check_same_thread=False)
+            self.conn = sqlite3.connect('recommend_for_plex.db', check_same_thread=False)
         except sqlite3.Error as e:
             self.logger.error(f"Database connection error: {e}")
             raise
