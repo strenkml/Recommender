@@ -61,7 +61,7 @@ The application uses a PySide6 interface, enabling you to configure keys, Plex s
 ## Features
 
 - **GUI-based**: Manage everything from one window.
-- **Database-Backed**: Uses SQLite (`media_recommender.db`).
+- **Database-Backed**: Uses SQLite (`recommend_for_plex.db`).
 - **Embedding Generation**: Uses transformers, graph networks, and custom neural encoders to generate a rich embedding for each media item.
 - **Knowledge Graph**: Captures relationships between media items, genres, keywords, and entities extracted from textual metadata.
 - **Feedback & Training**: Allows user ratings to dynamically improve the recommendation engine.
@@ -169,7 +169,7 @@ A separate **Background Trainer** thread is initialized at startup. It:
 
 ### Database Schema
 
-The SQLite database `media_recommender.db` has these key tables:
+The SQLite database `recommend_for_plex.db` has these key tables:
 
 - **media_items**: Stores movies/shows metadata (title, year, genres, summary, runtime, etc.).
 - **genre_preferences**: Tracks how users rate different genres (for a basic collaborative approach).
