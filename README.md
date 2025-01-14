@@ -2,6 +2,8 @@
 
 This is a comprehensive recommendation system that integrates with Plex, TMDB, and TVDB to provide movie and TV show recommendations. It uses PyQt5 for the GUI, several PyTorch-based encoders and neural networks for generating embeddings, a knowledge graph for content relationships, and an SQLite database for storing media items, embeddings, preferences, and feedback.
 
+This is designed to be very good at learning, but still light enough to run on a laptop using only CPU.
+
 ![{832FAD55-DB9E-4548-AF46-EBEE23BC66E5}](https://github.com/user-attachments/assets/e4bd1173-701f-4714-9da7-a1b416df40a3)
 
 
