@@ -1082,7 +1082,7 @@ class CleanupWorker(QObject):
 class MediaRecommenderApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Plex Recommend")
+        self.setWindowTitle("Recommend For Plex")
         self.setMinimumSize(1200, 800)
        
         self.logger = logging.getLogger(__name__)
@@ -1207,7 +1207,7 @@ class MediaRecommenderApp(QMainWindow):
         QTimer.singleShot(24 * 60 * 60 * 1000, self.schedule_cache_updates)
                        
     def init_ui(self):
-        self.setWindowTitle("Plex Recommend")
+        self.setWindowTitle("Recommend For Plex")
         self.setMinimumSize(1200, 800)
         
         self.tabs = QTabWidget()
