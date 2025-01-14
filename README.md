@@ -60,7 +60,7 @@ The application uses a PyQt5 interface, enabling you to configure keys, Plex ser
 
 ## Features
 
-- **GUI-based**: Manage everything from one window (PyQt5).
+- **GUI-based**: Manage everything from one window.
 - **Database-Backed**: Uses SQLite (`media_recommender.db`).
 - **Embedding Generation**: Uses transformers, graph networks, and custom neural encoders to generate a rich embedding for each media item.
 - **Knowledge Graph**: Captures relationships between media items, genres, keywords, and entities extracted from textual metadata.
