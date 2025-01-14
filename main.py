@@ -1,6 +1,7 @@
 import sys
 import random
 import os
+import contextlib
 import re
 import sqlite3
 import torch
@@ -29,7 +30,7 @@ from PySide6.QtCore import (
     Qt, QTimer, QThread, Signal, QUrl, QObject, QEventLoop, QSize
 )
 from PySide6.QtGui import (
-    QPalette, QColor, QPixmap, QPainter, QFont, QIcon
+    QPalette, QColor, QPixmap, QPainter, QFont, QIcon, QCloseEvent
 )
 from PySide6.QtNetwork import (
     QNetworkAccessManager, QNetworkRequest, QNetworkReply
@@ -53,129 +54,201 @@ class Database:
         return Database._instance
 
     def __init__(self):
-        self.conn = sqlite3.connect('media_recommender.db', check_same_thread=False)
+        self.conn = None
         self.write_lock = threading.Lock()
+        self._connect()
+        self._optimize_connection()
         self._create_tables()
+        self._create_indices()
+        self.logger = logging.getLogger(__name__)
+
+    def _connect(self):
+        try:
+            self.conn = sqlite3.connect('media_recommender.db', check_same_thread=False)
+        except sqlite3.Error as e:
+            self.logger.error(f"Database connection error: {e}")
+            raise
+
+    def _optimize_connection(self):
+        cursor = None
+        try:
+            cursor = self.conn.cursor()
+            pragmas = [
+                'PRAGMA journal_mode = WAL',
+                'PRAGMA synchronous = NORMAL',
+                'PRAGMA cache_size = -2000000',
+                'PRAGMA mmap_size = 30000000000',
+                'PRAGMA temp_store = MEMORY',
+                'PRAGMA page_size = 4096',
+                'PRAGMA foreign_keys = ON'
+            ]
+            for pragma in pragmas:
+                cursor.execute(pragma)
+            self.conn.commit()
+        except sqlite3.Error as e:
+            if self.conn:
+                self.conn.rollback()
+            raise
+        finally:
+            if cursor:
+                cursor.close()
 
     def _create_tables(self):
         with self.write_lock:
             cursor = self.conn.cursor()
-
-            cursor.execute('''
-            CREATE TABLE IF NOT EXISTS media_items (
-                id INTEGER PRIMARY KEY,
-                title TEXT,
-                type TEXT,
-                year INTEGER,
-                runtime TEXT,
-                summary TEXT,
-                genres TEXT,
-                poster_url TEXT,
-                tvdb_id TEXT,
-                tmdb_id TEXT,
-                original_title TEXT,
-                overview TEXT,
-                popularity REAL,
-                vote_average REAL,
-                vote_count INTEGER,
-                status TEXT,
-                tagline TEXT,
-                backdrop_path TEXT,
-                release_date TEXT,
-                content_rating TEXT,
-                network TEXT,
-                credits TEXT,
-                keywords TEXT,
-                videos TEXT,
-                language TEXT,
-                production_companies TEXT,
-                reviews TEXT,
-                episodes TEXT,
-                season_count INTEGER,
-                episode_count INTEGER,
-                first_air_date TEXT,
-                last_air_date TEXT
-            )
-            ''')
-
-            cursor.execute('''
-            CREATE TABLE IF NOT EXISTS genre_preferences (
-                genre TEXT PRIMARY KEY,
-                rating_sum REAL,
-                rating_count INTEGER
-            )
-            ''')
-
-            cursor.execute('''
-            CREATE TABLE IF NOT EXISTS user_feedback (
-                id INTEGER PRIMARY KEY,
-                media_id INTEGER,
-                rating INTEGER,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (media_id) REFERENCES media_items (id)
-            )
-            ''')
-
-            cursor.execute('''
-            CREATE TABLE IF NOT EXISTS embedding_cache (
-                media_id INTEGER PRIMARY KEY,
-                embedding BLOB,
-                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (media_id) REFERENCES media_items (id)
-            )
-            ''')
-
-            cursor.execute("PRAGMA table_info(media_items)")
-            columns = cursor.fetchall()
-            column_names = [column[1] for column in columns]
-
-            if 'score_adjustment' not in column_names:
+            try:
                 cursor.execute('''
-                ALTER TABLE media_items 
-                ADD COLUMN score_adjustment REAL DEFAULT 0
+                    CREATE TABLE IF NOT EXISTS media_items (
+                        id INTEGER PRIMARY KEY,
+                        title TEXT,
+                        type TEXT,
+                        year INTEGER,
+                        runtime TEXT,
+                        summary TEXT,
+                        genres TEXT,
+                        poster_url TEXT,
+                        tvdb_id TEXT,
+                        tmdb_id TEXT,
+                        original_title TEXT,
+                        overview TEXT,
+                        popularity REAL,
+                        vote_average REAL,
+                        vote_count INTEGER,
+                        status TEXT,
+                        tagline TEXT,
+                        backdrop_path TEXT,
+                        release_date TEXT,
+                        content_rating TEXT,
+                        network TEXT,
+                        credits TEXT,
+                        keywords TEXT,
+                        videos TEXT,
+                        language TEXT,
+                        production_companies TEXT,
+                        reviews TEXT,
+                        episodes TEXT,
+                        season_count INTEGER,
+                        episode_count INTEGER,
+                        first_air_date TEXT,
+                        last_air_date TEXT,
+                        score_adjustment REAL DEFAULT 0
+                    )
                 ''')
 
-            cursor.execute('''
-            CREATE TABLE IF NOT EXISTS similarity_matrix (
-                item1_id INTEGER,
-                item2_id INTEGER,
-                similarity REAL,
-                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (item1_id, item2_id),
-                FOREIGN KEY (item1_id) REFERENCES media_items (id),
-                FOREIGN KEY (item2_id) REFERENCES media_items (id)
-            )   
-            ''')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_media_items_title_year ON media_items (title, year)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_user_feedback_media_id ON user_feedback (media_id)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_feedback_media_rating ON user_feedback (media_id, rating)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_items_type ON media_items (type)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_media_genres ON media_items (genres)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_media_embedding_join ON media_items (id)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_feedback_media_join ON user_feedback (media_id)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_sim_item1 ON similarity_matrix (item1_id)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_sim_item2 ON similarity_matrix (item2_id)')
-        
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS genre_preferences (
+                        genre TEXT PRIMARY KEY,
+                        rating_sum REAL,
+                        rating_count INTEGER
+                    )
+                ''')
+
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS user_feedback (
+                        id INTEGER PRIMARY KEY,
+                        media_id INTEGER,
+                        rating INTEGER,
+                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (media_id) REFERENCES media_items (id)
+                    )
+                ''')
+
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS embedding_cache (
+                        media_id INTEGER PRIMARY KEY,
+                        embedding BLOB,
+                        last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (media_id) REFERENCES media_items (id)
+                    )
+                ''')
+
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS similarity_matrix (
+                        item1_id INTEGER,
+                        item2_id INTEGER,
+                        similarity REAL,
+                        last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (item1_id, item2_id),
+                        FOREIGN KEY (item1_id) REFERENCES media_items (id),
+                        FOREIGN KEY (item2_id) REFERENCES media_items (id)
+                    )
+                ''')
+
+                self.conn.commit()
+            finally:
+                cursor.close()
+
+    def _create_indices(self):
+        cursor = self.conn.cursor()
+        try:
+            indices = [
+                'CREATE INDEX IF NOT EXISTS idx_media_type_year ON media_items (type, year)',
+                'CREATE INDEX IF NOT EXISTS idx_media_vote_popularity ON media_items (vote_average, vote_count, popularity)',
+                'CREATE INDEX IF NOT EXISTS idx_feedback_timestamp ON user_feedback (timestamp)',
+                'CREATE INDEX IF NOT EXISTS idx_embedding_last_updated ON embedding_cache (last_updated)',
+                'CREATE INDEX IF NOT EXISTS idx_similarity_last_updated ON similarity_matrix (last_updated)',
+                'CREATE INDEX IF NOT EXISTS idx_media_recommendations ON media_items (type, vote_average, vote_count, popularity, id, title, genres)',
+                'CREATE INDEX IF NOT EXISTS idx_feedback_analysis ON user_feedback (media_id, rating, timestamp)',
+                'CREATE INDEX IF NOT EXISTS idx_media_title_search ON media_items(title COLLATE NOCASE)',
+                'CREATE INDEX IF NOT EXISTS idx_genre_preferences_rating ON genre_preferences(rating_sum, rating_count)',
+                'CREATE INDEX IF NOT EXISTS idx_active_media ON media_items(id, type) WHERE status != "Ended" AND status != "Cancelled"',
+                'CREATE INDEX IF NOT EXISTS idx_embedding_cleanup ON embedding_cache(last_updated)',
+                'CREATE INDEX IF NOT EXISTS idx_media_items_title_year ON media_items (title, year)',
+                'CREATE INDEX IF NOT EXISTS idx_user_feedback_media_id ON user_feedback (media_id)',
+                'CREATE INDEX IF NOT EXISTS idx_feedback_media_rating ON user_feedback (media_id, rating)',
+                'CREATE INDEX IF NOT EXISTS idx_items_type ON media_items (type)',
+                'CREATE INDEX IF NOT EXISTS idx_media_genres ON media_items (genres)',
+                'CREATE INDEX IF NOT EXISTS idx_media_embedding_join ON media_items (id)',
+                'CREATE INDEX IF NOT EXISTS idx_feedback_media_join ON user_feedback (media_id)',
+                'CREATE INDEX IF NOT EXISTS idx_sim_item1 ON similarity_matrix (item1_id)',
+                'CREATE INDEX IF NOT EXISTS idx_sim_item2 ON similarity_matrix (item2_id)'
+            ]
+            for index in indices:
+                cursor.execute(index)
+
+            cursor.execute('ANALYZE media_items')
+            cursor.execute('ANALYZE user_feedback')
+            cursor.execute('ANALYZE embedding_cache')
+            cursor.execute('ANALYZE similarity_matrix')
+            cursor.execute('ANALYZE genre_preferences')
 
             self.conn.commit()
+        except sqlite3.Error as e:
+            self.conn.rollback()
+            raise
+        finally:
+            cursor.close()
 
-    def cleanup_old_cache(self):
+    @contextlib.contextmanager
+    def get_cursor(self):
+        cursor = None
         try:
+            cursor = self.conn.cursor()
+            yield cursor
+        finally:
+            if cursor:
+                cursor.close()
+
+    def execute_write(self, query, params=None):
+        if not self.write_lock.acquire(timeout=10):
+            raise TimeoutError("Could not acquire database write lock")
+        try:
+            with self.get_cursor() as cursor:
+                cursor.execute(query, params or ())
+                self.conn.commit()
+        except sqlite3.Error as e:
             if self.conn:
-                with self.write_lock:
-                    cursor = self.conn.cursor()
-                    cursor.execute('''
-                        DELETE FROM embedding_cache 
-                        WHERE last_updated < datetime('now', '-30 days')
-                    ''')
-                    self.conn.commit()
-            else:
-                logging.error("Cannot clean up cache: Database connection is closed.")
-        except Exception as e:
-            logging.error(f"Error cleaning up cache: {str(e)}")
+                self.conn.rollback()
+            raise
+        finally:
+            self.write_lock.release()
 
+    def execute_read(self, query, params=None):
+        with self.get_cursor() as cursor:
+            cursor.execute(query, params or ())
+            return cursor.fetchall()
 
-    def save_embedding(self, media_id: int, embedding: bytes) -> None:
+    def save_embedding(self, media_id, embedding):
         with self.write_lock:
             cursor = self.conn.cursor()
             try:
@@ -186,63 +259,20 @@ class Database:
                 self.conn.commit()
             except sqlite3.Error as e:
                 self.conn.rollback()
-                print(f"Error saving embedding for media_id {media_id}: {str(e)}")
                 raise
             finally:
                 cursor.close()
 
-    def _load_embedding(self, media_id: int) -> Optional[torch.Tensor]:
+    def load_embedding(self, media_id):
         try:
-            print(f"\nDiagnostic _load_embedding for media_id {media_id}")
-            
-            cached_embedding = self.db.load_embedding(media_id)
-            if cached_embedding is not None:
-                print("1. Retrieved cached embedding")
-                print(f"   Type: {type(cached_embedding)}")
-                print(f"   Size: {len(cached_embedding)} bytes")
-                
-                array = np.frombuffer(cached_embedding, dtype=np.float32)
-                print("2. Created initial array")
-                print(f"   Shape: {array.shape}")
-                print(f"   Writable: {array.flags.writeable}")
-                
-                array_copy = array.copy()
-                print("3. Created array copy")
-                print(f"   Shape: {array_copy.shape}")
-                print(f"   Writable: {array_copy.flags.writeable}")
-                
-                try:
-                    array_copy[0] = array_copy[0]  
-                    print("4. Successfully verified write operation")
-                except Exception as e:
-                    print(f"4. Write test failed: {str(e)}")
-                
-                tensor = torch.from_numpy(array_copy)
-                print("5. Converted to tensor")
-                print(f"   Shape: {tensor.shape}")
-                print(f"   Device: {tensor.device}")
-                print(f"   Requires grad: {tensor.requires_grad}")
-                
-                tensor = tensor.to(self.device)
-                print("6. Moved to device")
-                print(f"   New device: {tensor.device}")
-                
-                final_tensor = tensor.view(1, -1)
-                print("7. Reshaped tensor")
-                print(f"   Final shape: {final_tensor.shape}")
-                
-                return final_tensor
-                
-            print("No cached embedding found")
+            with self.get_cursor() as cursor:
+                cursor.execute('SELECT embedding FROM embedding_cache WHERE media_id = ?', (media_id,))
+                result = cursor.fetchone()
+                return result[0] if result and result[0] else None
+        except sqlite3.Error as e:
+            self.logger.error(f"Error loading embedding for media_id {media_id}: {e}")
             return None
-                
-        except Exception as e:
-            print(f"Error in _load_embedding: {str(e)}")
-            print(f"Error type: {type(e)}")
-            print(f"Full traceback: {traceback.format_exc()}")
-            self.logger.error(f"Error loading embedding for media_id {media_id}: {str(e)}")
-            return None
-        
+
     def save_feedback(self, media_id, rating):
         with self.write_lock:
             cursor = self.conn.cursor()
@@ -254,25 +284,14 @@ class Database:
                 self.conn.commit()
             except sqlite3.Error as e:
                 self.conn.rollback()
-                print(f"Error saving feedback for media_id {media_id}: {str(e)}")
                 raise
             finally:
                 cursor.close()
 
     def get_feedback(self):
-        cursor = self.conn.cursor()
-        try:
-            cursor.execute('''
-                SELECT media_id, AVG(rating) as avg_rating
-                FROM user_feedback
-                GROUP BY media_id
-            ''')
+        with self.get_cursor() as cursor:
+            cursor.execute('SELECT media_id, AVG(rating) as avg_rating FROM user_feedback GROUP BY media_id')
             return cursor.fetchall()
-        except sqlite3.Error as e:
-            print(f"Error retrieving feedback: {str(e)}")
-            raise
-        finally:
-            cursor.close()
 
     def get_media_items(self, filters=None):
         filters = filters or {}
@@ -287,64 +306,86 @@ class Database:
         if conditions:
             query += " WHERE " + " AND ".join(conditions)
 
-        cursor = self.conn.cursor()
         try:
-            cursor.execute(query, params)
-            rows = cursor.fetchall()
-            return [{'id': row[0], 'title': row[1], 'genres': row[2]} for row in rows]
-        except sqlite3.Error as e:
-            logging.error(f"Error retrieving media items: {str(e)}")
-            return []
-        finally:
-            cursor.close()
-
-    def load_embedding(self, media_id: int) -> Optional[bytes]:
-        try:
-            with self.write_lock:
-                cursor = self.conn.cursor()
-                cursor.execute(
-                    'SELECT embedding FROM embedding_cache WHERE media_id = ?', 
-                    (media_id,)
-                )
-                result = cursor.fetchone()
-                
-                if result and result[0]:
-                    return result[0]
-                return None
-                
-        except sqlite3.Error as e:
-            print(f"Error loading embedding for media_id {media_id}: {str(e)}")
-            return None
-        finally:
-            cursor.close()
-            
-    def execute_write(self, query, params=None):
-        with self.write_lock:
-            cursor = self.conn.cursor()
-            try:
-                if params:
-                    cursor.execute(query, params)
-                else:
-                    cursor.execute(query)
-                self.conn.commit()
-            finally:
-                cursor.close()
-
-    def execute_read(self, query, params=None):
-        cursor = self.conn.cursor()
-        try:
-            if params:
+            with self.get_cursor() as cursor:
                 cursor.execute(query, params)
-            else:
-                cursor.execute(query)
-            return cursor.fetchall()
+                rows = cursor.fetchall()
+                return [{'id': row[0], 'title': row[1], 'genres': row[2]} for row in rows]
+        except sqlite3.Error as e:
+            self.logger.error(f"Error retrieving media items: {e}")
+            return []
+
+    def cleanup_old_cache(self):
+        try:
+            self.execute_write('DELETE FROM embedding_cache WHERE last_updated < datetime("now", "-30 days")')
+        except sqlite3.Error as e:
+            self.logger.error(f"Error cleaning up cache: {e}")
+
+    def optimize_database(self):
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute('VACUUM')
+            cursor.execute('ANALYZE')
+            cursor.execute('ANALYZE media_items')
+            cursor.execute('ANALYZE user_feedback')
+            cursor.execute('ANALYZE embedding_cache')
+            cursor.execute('ANALYZE similarity_matrix')
+            cursor.execute('ANALYZE genre_preferences')
+            self.conn.commit()
+        except sqlite3.Error as e:
+            self.logger.error(f"Error optimizing database: {e}")
+            raise
         finally:
             cursor.close()
+
+    def get_database_stats(self):
+        with self.get_cursor() as cursor:
+            stats = {}
+            tables = ['media_items', 'user_feedback', 'embedding_cache', 'similarity_matrix', 'genre_preferences']
+            
+            for table in tables:
+                cursor.execute(f"SELECT COUNT(*) FROM {table}")
+                stats[f"{table}_count"] = cursor.fetchone()[0]
+
+            cursor.execute("PRAGMA page_count")
+            page_count = cursor.fetchone()[0]
+            cursor.execute("PRAGMA page_size")
+            page_size = cursor.fetchone()[0]
+            stats['database_size_mb'] = (page_count * page_size) / (1024 * 1024)
+
+            cursor.execute("SELECT name, sql FROM sqlite_master WHERE type='index'")
+            stats['indices'] = cursor.fetchall()
+
+            return stats
 
     def close(self):
-        with self.write_lock:
+        if not self.write_lock.acquire(timeout=5):
+            self.logger.warning("Could not acquire lock for database closing")
+            return False 
+        
+        success = False
+        try:
             if self.conn:
-                self.conn.close()
+                try:
+                    if self.conn:
+                        self.conn.commit() 
+                    self.conn.close()
+                    success = True
+                except sqlite3.Error as e:
+                    self.logger.error(f"Error closing database: {e}")
+                    try:
+                        self.conn.rollback()
+                    except Exception:
+                        pass
+                finally:
+                    self.conn = None  
+        finally:
+            self.write_lock.release()
+        return success
+
+    def __del__(self):
+        if hasattr(self, 'conn') and self.conn is not None:
+            self.close()
 
 class APIClient:
     def __init__(self):
@@ -982,11 +1023,66 @@ class TMDBClient:
         if not path or not self.image_base_url:
             return ""
         return f"{self.image_base_url}{size}{path}"
+
+class CleanupWorker(QObject):
+    finished = Signal()
+
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+
+    def cleanup(self):
+        try:
+            if hasattr(self.app, 'recommender') and self.app.recommender:
+                self.app.recommender._stop_flag = True
+                if hasattr(self.app.recommender, 'similarity_thread') and self.app.recommender.similarity_thread.isRunning():
+                    self.app.recommender.similarity_worker.stop()
+                    self.app.recommender.similarity_thread.quit()
+                    self.app.recommender.similarity_thread.wait(3000)
+                self.app.recommender.cleanup()
+                self.app.recommender = None
+
+            if hasattr(self.app, 'scan_thread') and self.app.scan_thread.isRunning():
+                self.app.scan_thread.stop()
+                self.app.scan_thread.wait(5000)
+
+            if self.app.background_trainer:
+                self.app.background_trainer._stop_flag = True
+                if self.app.background_trainer.isRunning():
+                    self.app.background_trainer.wait(2000)
+                self.app.background_trainer = None
+
+            if self.app.db:
+                self.app.db.cleanup_old_cache()
+                self.app.db.close()
+                self.app.db = None
+
+            if self.app.media_scanner:
+                if hasattr(self.app.media_scanner, 'close'):
+                    try:
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        loop.run_until_complete(self.app.media_scanner.close())
+                        loop.close()
+                    except Exception:
+                        pass
+                self.app.media_scanner = None
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            if hasattr(self.app, 'poster_downloader'):
+                self.app.poster_downloader.cleanup()
+
+        except Exception as e:
+            print(f"Error during cleanup: {str(e)}")
+        finally:
+            self.finished.emit()
                                        
 class MediaRecommenderApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Plex Recommender")
+        self.setWindowTitle("Plex Recommend")
         self.setMinimumSize(1200, 800)
        
         self.logger = logging.getLogger(__name__)
@@ -1008,6 +1104,7 @@ class MediaRecommenderApp(QMainWindow):
         self.db = None
         self.recommender = None
         self.media_scanner = None
+        self.poster_downloader = PosterDownloader()
        
         QTimer.singleShot(0, self.init_background_components)
 
@@ -1015,29 +1112,25 @@ class MediaRecommenderApp(QMainWindow):
         try:
             print("Initializing background components...")
             
-            
             self.db = Database.get_instance()
             print("Database initialized")
-            
             
             self.recommender = RecommendationEngine(self.db)
             print("Recommendation engine initialized")
             
-            
             self.media_scanner = MediaScanner()
             print("Media scanner initialized")
-            
             
             self.schedule_cache_updates()
             print("Cache updates scheduled")
             
-            if self.background_trainer is None:
+            if not hasattr(self, 'background_trainer') or self.background_trainer is None:
                 self.background_trainer = BackgroundTrainer(self.recommender, self.db)
                 self.background_trainer.training_status.connect(self.update_progress)
+                self.background_trainer.training_status.connect(self._handle_training_status)
                 self.background_trainer.start()
                 print("Background trainer initialized and started")
-
-            
+                
             try:
                 self.media_scanner.configure(
                     plex_url=self.plex_url.text(),
@@ -1049,12 +1142,22 @@ class MediaRecommenderApp(QMainWindow):
             except Exception as e:
                 self.logger.error(f"Warning: Could not configure media scanner: {e}")
             
-            
             QTimer.singleShot(1000, self._load_initial_recommendations)
             
         except Exception as e:
             self.logger.error(f"Error in background initialization: {e}")
             print(f"Error initializing components: {e}")
+
+    def _handle_training_status(self, message: str):
+        try:
+            if "error" in message.lower():
+                self.logger.error(message)
+                self.show_error_notification(message)
+            elif "complete" in message.lower():
+                self._refresh_recommendations()
+        except Exception as e:
+            self.logger.error(f"Error handling training status: {e}")
+
 
     def _load_initial_recommendations(self):
         try:
@@ -1104,7 +1207,7 @@ class MediaRecommenderApp(QMainWindow):
         QTimer.singleShot(24 * 60 * 60 * 1000, self.schedule_cache_updates)
                        
     def init_ui(self):
-        self.setWindowTitle("Plex Recommender")
+        self.setWindowTitle("Plex Recommend")
         self.setMinimumSize(1200, 800)
         
         self.tabs = QTabWidget()
@@ -1279,21 +1382,29 @@ class MediaRecommenderApp(QMainWindow):
             if stars > 0:
                 self.submit_rating(rating_type, stars, media_type)
                
-    def submit_rating(self, rating, media_type):
+    def submit_rating(self, rating: int, media_type: str):
         current_id = self.media_widgets[media_type]['current_item_id']
         if current_id is not None:
-            cursor = self.db.conn.cursor()
-            cursor.execute('''
-                SELECT * FROM media_items WHERE id = ?
-            ''', (current_id,))
-            row = cursor.fetchone()
-            if row:
-                columns = [description[0] for description in cursor.description]
-                content_data = dict(zip(columns, row))
-               
-                self.recommender.train_with_feedback(current_id, rating, content_data)
-                self.show_next_recommendation(media_type)
-            cursor.close()
+            try:
+                cursor = self.db.conn.cursor()
+                cursor.execute('''
+                    SELECT * FROM media_items WHERE id = ?
+                ''', (current_id,))
+                row = cursor.fetchone()
+                if row:
+                    columns = [description[0] for description in cursor.description]
+                    content_data = dict(zip(columns, row))
+                    
+                    self.recommender.train_with_feedback(current_id, rating, content_data)
+                    
+                    if hasattr(self, 'background_trainer') and self.background_trainer:
+                        self.background_trainer.queue_item_for_training(content_data, priority=True)
+                    
+                    self.show_next_recommendation(media_type)
+                cursor.close()
+            except Exception as e:
+                self.logger.error(f"Error submitting rating: {e}")
+                QMessageBox.warning(self, "Error", f"Failed to submit rating: {str(e)}")
        
     def load_config(self):
         config_path = 'config.json'
@@ -1327,7 +1438,7 @@ class MediaRecommenderApp(QMainWindow):
             widgets['summary_text'].setPlainText(
                 "No recommendations available. Please ensure your libraries are scanned."
             )
-            self._set_default_poster(widgets['poster_label'])
+            self.poster_downloader._set_default_poster(widgets['poster_label']) 
             return
 
         try:
@@ -1335,9 +1446,7 @@ class MediaRecommenderApp(QMainWindow):
             title = item.get('title', 'Unknown Title')
             print(f"Displaying: {title}")
             
-            
             widgets['title_label'].setText(title)
-            
             
             year = item.get('year', '')
             runtime = item.get('runtime', '')
@@ -1345,17 +1454,14 @@ class MediaRecommenderApp(QMainWindow):
             year_runtime = ' | '.join(filter(None, [str(year), runtime_str]))
             widgets['year_runtime_label'].setText(year_runtime)
             
-            
             genres = item.get('genres', [])
             if isinstance(genres, str):
                 genres = json.loads(genres) if genres.startswith('[') else genres.split(',')
             genres_str = ", ".join(str(genre).strip() for genre in genres if genre)
             widgets['genres_label'].setText(genres_str)
             
-            
             summary = item.get('summary', 'No summary available')
             widgets['summary_text'].setPlainText(summary)
-            
             
             self._update_poster_image(item, widgets['poster_label'])
             
@@ -1369,8 +1475,8 @@ class MediaRecommenderApp(QMainWindow):
             widgets['year_runtime_label'].setText("")
             widgets['genres_label'].setText("")
             widgets['summary_text'].setPlainText(f"Error loading item: {str(e)}")
-            self._set_default_poster(widgets['poster_label'])
-            
+            self.poster_downloader._set_default_poster(widgets['poster_label'])
+                
     def show_next_recommendation(self, media_type):
         print(f"\nFetching next recommendation for {media_type}")
         try:
@@ -1408,55 +1514,22 @@ class MediaRecommenderApp(QMainWindow):
 
     def _update_poster_image(self, item: Dict, poster_label: QLabel) -> None:
         if not item or not item.get('poster_url'):
-            self._set_default_poster(poster_label)
+            self.poster_downloader._set_default_poster(poster_label)
             return
 
         try:
             url = self._get_full_poster_url(item['poster_url'])
             if not url:
-                self._set_default_poster(poster_label)
+                self.poster_downloader._set_default_poster(poster_label)
                 return
 
-            if not hasattr(self, 'network_manager'):
-                self.network_manager = QNetworkAccessManager()
-                self.network_manager.finished.connect(self._handle_network_response)
-
-            request = QNetworkRequest(QUrl(url))
-            request.setAttribute(QNetworkRequest.Attribute.User, poster_label)
-            self.network_manager.get(request)
+            self.poster_downloader.download_poster(url, poster_label)
 
         except Exception as e:
             self.logger.error(f"Error updating poster: {str(e)}")
-            self._set_default_poster(poster_label)
+            self.poster_downloader._set_default_poster(poster_label)
 
-    def _handle_network_response(self, reply: QNetworkReply) -> None:
-        poster_label = reply.request().attribute(QNetworkRequest.Attribute.User)
-        
-        try:
-            if reply.error() == QNetworkReply.NetworkError.NoError:
-                data = reply.readAll()
-                
-                pixmap = QPixmap()
-                if pixmap.loadFromData(data):
-                    scaled_pixmap = pixmap.scaled(
-                        300, 450,
-                        Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.SmoothTransformation
-                    )
-                    poster_label.setPixmap(scaled_pixmap)
-                    poster_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                else:
-                    self._set_default_poster(poster_label)
-            else:
-                self.logger.error(f"Network error: {reply.errorString()}")
-                self._set_default_poster(poster_label)
-
-        except Exception as e:
-            self.logger.error(f"Error handling network response: {str(e)}")
-            self._set_default_poster(poster_label)
-        finally:
-            reply.deleteLater()
-
+    
     def _get_full_poster_url(self, poster_url: str) -> Optional[str]:
         try:
             if poster_url.startswith('/'):
@@ -1480,37 +1553,22 @@ class MediaRecommenderApp(QMainWindow):
             self.logger.error(f"Error constructing poster URL: {str(e)}")
             return None
 
-    def _set_default_poster(self, label):
-        try:
-            pixmap = QPixmap(300, 450)
-            pixmap.fill(QColor(40, 40, 40)) 
-            
-            with QPainter(pixmap) as painter:
-                painter.setPen(QColor(200, 200, 200))
-                painter.setFont(QFont('Arial', 14))
-                painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, "No\nPoster\nAvailable")
-            
-            label.setPixmap(pixmap)
-            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            
-        except Exception as e:
-            self.logger.error(f"Error setting default poster: {e}")
-
-
-    def _set_default_poster(self, label):
-        try:
-            pixmap = QPixmap(300, 450)
-            pixmap.fill(QColor(200, 200, 200))
-           
-            with QPainter(pixmap) as painter:
-                painter.setPen(QColor(100, 100, 100))
-                painter.setFont(QFont('Arial', 14))
-                painter.drawText(pixmap.rect(), Qt.AlignCenter, "No\nPoster\nAvailable")
-               
-            label.setPixmap(pixmap)
-           
-        except Exception as e:
-            self.logger.error(f"Error setting default poster: {e}")
+    def cleanup_background_trainer(self):
+        if hasattr(self, 'background_trainer') and self.background_trainer:
+            try:
+                self.background_trainer._stop_flag.set()
+                start_time = time.time()
+                while self.background_trainer.isRunning() and (time.time() - start_time) < 5:
+                    QApplication.processEvents()
+                    time.sleep(0.1)
+                
+                if self.background_trainer.isRunning():
+                    self.background_trainer.terminate()
+                    self.background_trainer.wait(1000)
+                
+                self.background_trainer = None
+            except Exception as e:
+                self.logger.error(f"Error cleaning up background trainer: {e}")
        
     def scan_libraries(self):
         selected = self.library_list.selectedItems()
@@ -1534,21 +1592,38 @@ class MediaRecommenderApp(QMainWindow):
 
             self.scan_thread = ScanThread(self.media_scanner, library_names)
             self.scan_thread.progress.connect(self.update_progress)
-            self.scan_thread.finished.connect(self._on_scan_completed)  
+            self.scan_thread.finished.connect(self._on_scan_completed)
             self.scan_thread.start()
+
+            if self.background_trainer:
+                self.background_trainer._stop_flag.set()
+                self.background_trainer.wait()
+                self.background_trainer._stop_flag.clear()
+                self.background_trainer.start()
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to scan libraries: {str(e)}")
 
     def _on_scan_completed(self):
         self.progress_text.append("Scan completed!")
-        
-        
+        if self.recommender:
+            self.recommender.knowledge_graph = self.recommender._initialize_knowledge_graph()
+    
         QTimer.singleShot(1000, self._load_initial_recommendations)
+
+    def show_error_notification(self, message: str):
+        QMessageBox.warning(self, "Training Error", message)
+
+    def _refresh_recommendations(self):
+        try:
+            self.show_next_recommendation('movie')
+            self.show_next_recommendation('show')
+        except Exception as e:
+            self.logger.error(f"Error refreshing recommendations: {e}")
         
     def closeEvent(self, event):
         print("\nInitiating application shutdown...")
-
+        
         progress_dialog = QDialog(self)
         progress_dialog.setWindowTitle("Shutting Down")
         layout = QVBoxLayout()
@@ -1559,106 +1634,27 @@ class MediaRecommenderApp(QMainWindow):
         progress_dialog.show()
         QApplication.processEvents()
 
-        try:
-            if hasattr(self, 'recommender') and self.recommender:
-                self.recommender._stop_flag = True
+        cleanup_thread = QThread()
+        cleanup_worker = CleanupWorker(self)
+        cleanup_worker.moveToThread(cleanup_thread)
+        
+        cleanup_thread.started.connect(cleanup_worker.cleanup)
+        cleanup_worker.finished.connect(cleanup_thread.quit)
+        cleanup_worker.finished.connect(cleanup_worker.deleteLater)
+        cleanup_thread.finished.connect(cleanup_thread.deleteLater)
+        cleanup_worker.finished.connect(progress_dialog.close)
+        cleanup_worker.finished.connect(lambda: event.accept())
+        
+        QTimer.singleShot(10000, lambda: self._force_cleanup(cleanup_thread, event, progress_dialog))
+        
+        cleanup_thread.start()
 
-            if hasattr(self, 'scan_thread') and self.scan_thread.isRunning():
-                status_label.setText("Stopping scan thread...")
-                QApplication.processEvents()
-                
-                self.scan_thread.stop()
-                start_time = time.time()
-                while self.scan_thread.isRunning() and (time.time() - start_time) < 5:
-                    QApplication.processEvents()
-                    time.sleep(0.1)
-                
-                if self.scan_thread.isRunning():
-                    self.scan_thread.terminate()
-                    self.scan_thread.wait()
-
-            if self.background_trainer:
-                status_label.setText("Stopping background trainer...")
-                QApplication.processEvents()
-                
-                try:
-                    self.background_trainer._stop_flag = True
-                    start_time = time.time()
-                    while self.background_trainer.isRunning() and (time.time() - start_time) < 2:
-                        QApplication.processEvents()
-                        time.sleep(0.1)
-                    
-                    if self.background_trainer.isRunning():
-                        self.background_trainer.terminate()
-                        self.background_trainer.wait(1000)
-                    
-                    self.background_trainer = None
-                        
-                except Exception as e:
-                    print(f"Error stopping background trainer: {e}")
-                    self.background_trainer = None
-
-            if self.recommender:
-                status_label.setText("Cleaning up recommendation engine...")
-                QApplication.processEvents()
-                
-                if hasattr(self.recommender, 'similarity_thread') and self.recommender.similarity_thread.isRunning():
-                    self.recommender.similarity_worker.stop()
-                    self.recommender.similarity_thread.quit()
-                    self.recommender.similarity_thread.wait(3000)
-                
-                with torch.no_grad():
-                    self.recommender.cleanup()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                self.recommender = None
-
-            if self.db:
-                status_label.setText("Cleaning up database...")
-                QApplication.processEvents()
-                
-                self.db.cleanup_old_cache()
-                self.db.close()
-                self.db = None
-
-            if self.media_scanner:
-                status_label.setText("Cleaning up media scanner...")
-                QApplication.processEvents()
-                
-                if hasattr(self.media_scanner, 'close'):
-                    if asyncio.iscoroutinefunction(self.media_scanner.close):
-                        try:
-                            loop = asyncio.new_event_loop()
-                            asyncio.set_event_loop(loop)
-                            loop.run_until_complete(self.media_scanner.close())
-                            loop.close()
-                        except Exception as e:
-                            print(f"Error closing media scanner: {e}")
-                    else:
-                        self.media_scanner.close()
-                self.media_scanner = None
-
-            if torch.cuda.is_available():
-                status_label.setText("Cleaning up CUDA memory...")
-                QApplication.processEvents()
-                torch.cuda.empty_cache()
-
-            print("Shutdown completed successfully")
-            progress_dialog.close()
-            event.accept()
-
-        except Exception as e:
-            print(f"Error during shutdown: {str(e)}")
-            print(f"Traceback: {traceback.format_exc()}")
-            progress_dialog.close()
-            
-            error_dialog = QMessageBox(self)
-            error_dialog.setIcon(QMessageBox.Critical)
-            error_dialog.setWindowTitle("Shutdown Error")
-            error_dialog.setText("An error occurred during shutdown.")
-            error_dialog.setDetailedText(f"Error: {str(e)}\n\nTraceback:\n{traceback.format_exc()}")
-            error_dialog.exec_()
-            
+    def _force_cleanup(self, thread: QThread, event: QCloseEvent, dialog: QDialog):
+        if thread.isRunning():
+            print("Cleanup taking too long, forcing shutdown...")
+            thread.terminate()
+            thread.wait(1000)
+            dialog.close()
             event.accept()
 
     def update_progress(self, message):
@@ -1745,9 +1741,10 @@ class MediaRecommenderApp(QMainWindow):
 class ContentEncoder(nn.Module):
     def __init__(self, input_dim=1540, hidden_dim=384, output_dim=384):
         super().__init__()
-        print(f"Initializing ContentEncoder with dims: input={input_dim}, hidden={hidden_dim}, output={output_dim}")
+        self.input_dim = 2180
+        print(f"Initializing ContentEncoder with dims: input={self.input_dim}, hidden={hidden_dim}, output={output_dim}")
         
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc1 = nn.Linear(self.input_dim, hidden_dim)
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.dropout1 = nn.Dropout(0.1)
         
@@ -2119,175 +2116,38 @@ class RecommendationEngine:
             if 'attention_embedding' in locals(): del attention_embedding
             if 'sage_embedding' in locals(): del sage_embedding
             torch.cuda.empty_cache()
-            
-    def _compute_embedding(self, media_item: Dict) -> torch.Tensor:
-        try:
-            cache_key = media_item['id']
-            
-            
-            with self.embeddings_lock:
-                cached_embedding = self.db.load_embedding(cache_key)
-                if cached_embedding is not None:
-                    
-                    array = np.frombuffer(cached_embedding, dtype=np.float32).copy()
-                    return torch.from_numpy(array).to(self.device).view(1, -1)
-
-            
-            with self.tensor_lock:
-                
-                features = []
-                for feature_fn in [
-                    self._encode_text_features,
-                    self._encode_numerical_features,
-                    self._encode_categorical_features,
-                    self._encode_temporal_features,
-                    self._encode_metadata_features,
-                    self._compute_graph_features
-                ]:
-                    try:
-                        feature = feature_fn(media_item)
-                        features.append(feature)
-                    except Exception as e:
-                        self.logger.error(f"Error computing {feature_fn.__name__}: {str(e)}")
-                        
-                        if feature_fn == self._encode_text_features:
-                            features.append(torch.zeros((1, 384), device=self.device))
-                        elif feature_fn == self._encode_numerical_features:
-                            features.append(torch.zeros((1, 4), device=self.device))
-                        elif feature_fn in [self._encode_categorical_features, self._encode_temporal_features, self._encode_metadata_features]:
-                            features.append(torch.zeros((1, 256), device=self.device))
-                        elif feature_fn == self._compute_graph_features:
-                            features.append(torch.zeros((1, 384), device=self.device))
-
-                
-                combined_features = torch.cat(features, dim=1)
-                
-                
-                with torch.no_grad():
-                    embedding = self.content_encoder(combined_features)
-                    embedding = embedding.detach().cpu()
-
-            
-            with self.embeddings_lock:
-                self.db.save_embedding(cache_key, embedding.numpy().tobytes())
-
-            return embedding.to(self.device)
-
-        except Exception as e:
-            self.logger.error(f"Error computing embedding: {str(e)}")
-            return torch.zeros((1, 384), device=self.device)
-
+    
     def _load_embedding(self, media_id: int) -> Optional[torch.Tensor]:
         try:
             cached_embedding = self.db.load_embedding(media_id)
             if cached_embedding is not None:
-                array = np.frombuffer(cached_embedding, dtype=np.float32).copy()
+                array = np.frombuffer(cached_embedding, dtype=np.float32).copy() 
                 tensor = torch.from_numpy(array).to(self.device)
                 return tensor.view(1, -1)
             return None
-            
         except Exception as e:
             self.logger.error(f"Error loading embedding for media_id {media_id}: {str(e)}")
             return None
-    def _encode_text_features(self, item):
-        text_fields = [
-            item.get('title', ''),
-            item.get('summary', ''),
-            item.get('overview', ''),
-            item.get('tagline', ''),
-            self._process_json_field(item.get('keywords', '[]')),
-            self._process_json_field(item.get('reviews', '[]')),
-        ]
-        
-        combined_text = ' [SEP] '.join(filter(None, text_fields))
-        
-        with torch.no_grad():
-            inputs = self.tokenizer(
-                combined_text,
-                return_tensors='pt',
-                truncation=True,
-                max_length=512,
-                padding=True
-            ).to(self.device)
-            
-            outputs = self.text_encoder(**inputs)
-            text_embedding = outputs.last_hidden_state.mean(dim=1)  
-            
-        return text_embedding
-
-    def _encode_numerical_features(self, item):
-        numerical_features = torch.tensor([[
-            float(item.get('popularity', 0)),
-            float(item.get('vote_average', 0)) / 10.0,
-            float(item.get('vote_count', 0)) / 10000.0,
-            float(item.get('year', 2000)) / 2025.0,
-        ]], device=self.device).float()  
-        
-        return numerical_features
-
-    def _encode_temporal_features(self, item):
-        temporal_features = torch.zeros(1, 32, device=self.device)
-        
-        year = int(item.get('year', datetime.now().year))
-        current_year = datetime.now().year
-        years_old = (current_year - year) / 100.0
-        temporal_features[0, 0] = years_old
-        
-        release_date = item.get('release_date', '')
-        if release_date:
-            try:
-                release_month = datetime.strptime(release_date, '%Y-%m-%d').month
-                temporal_features[0, release_month] = 1.0
-            except ValueError:
-                pass
-        
-        return self.temporal_encoder(temporal_features)  
-
-    def _encode_metadata_features(self, item):
-        production_companies = self._process_json_field(item.get('production_companies', '[]'))
-        credits = self._process_json_field(item.get('credits', '[]'))
-        keywords = self._process_json_field(item.get('keywords', '[]'))
-        
-        metadata_text = f"{production_companies} {credits} {keywords}"
-        
-        with torch.no_grad():
-            inputs = self.tokenizer(
-                metadata_text,
-                return_tensors='pt',
-                truncation=True,
-                max_length=256,
-                padding=True
-            ).to(self.device)
-            
-            outputs = self.text_encoder(**inputs)
-            metadata_embedding = outputs.last_hidden_state.mean(dim=1)  
-        
-        return self.metadata_encoder(metadata_embedding)  
 
     def _setup_models(self):
         try:
-            
             self.tokenizer = AutoTokenizer.from_pretrained("microsoft/MiniLM-L12-H384-uncased")
             self.text_encoder = AutoModel.from_pretrained("microsoft/MiniLM-L12-H384-uncased")
             self.text_encoder.to(self.device)
             
-            
             self.content_encoder = ContentEncoder(
-                input_dim=2180,  
+                input_dim=1540,
                 hidden_dim=384,
                 output_dim=384
             ).to(self.device)
-            
             
             self.genre_encoder = GenreEncoder().to(self.device)
             self.temporal_encoder = TemporalEncoder().to(self.device)
             self.metadata_encoder = MetadataEncoder().to(self.device)
             
-            
             self.graph_conv = GraphConvNetwork().to(self.device)
             self.graph_attention = GraphAttentionNetwork().to(self.device)
             self.graph_sage = GraphSageNetwork().to(self.device)
-            
             
             for model in [self.text_encoder, self.content_encoder, self.genre_encoder,
                         self.temporal_encoder, self.metadata_encoder, self.graph_conv,
@@ -2296,7 +2156,8 @@ class RecommendationEngine:
                 
         except Exception as e:
             self.logger.error(f"Error setting up models: {str(e)}")
-            raise    
+            raise
+
     def _extract_entities(self, text: str) -> List[str]:
         try:
             tokens = nltk.word_tokenize(text)
@@ -3234,32 +3095,65 @@ class RecommendationEngine:
         except Exception as e:
             self.logger.error(f"Error during cleanup: {str(e)}")
 
-    def _encode_text_features(self, item: Dict) -> torch.Tensor:
-        text_fields = [
-            item.get('title', ''),
-            item.get('summary', ''),
-            item.get('overview', ''),
-            item.get('tagline', ''),
-            self._process_json_field(item.get('keywords', '[]')),
-            self._process_json_field(item.get('reviews', '[]')),
-        ]
-        
-        combined_text = ' [SEP] '.join(filter(None, text_fields))
-        
-        with torch.no_grad():
-            inputs = self.tokenizer(
-                combined_text,
-                return_tensors='pt',
-                truncation=True,
-                max_length=512,
-                padding=True
-            ).to(self.device)
-            
-            outputs = self.text_encoder(**inputs)
-            text_embedding = outputs.last_hidden_state.mean(dim=1)  
-            
-        return text_embedding
+    def _safe_text_conversion(self, value) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (list, dict)):
+            try:
+                if isinstance(value, list):
+                    return " ".join(
+                        str(item.get('name', item.get('content', item))) 
+                        if isinstance(item, dict) 
+                        else str(item) 
+                        for item in value
+                    )
+                else:
+                    return str(value.get('name', value.get('content', str(value))))
+            except Exception:
+                return str(value)
+        return str(value)
 
+    def _encode_text_features(self, item: Dict) -> torch.Tensor:
+        try:
+            text_fields = []
+            
+
+            fields_to_process = [
+                item.get('title', ''),
+                item.get('summary', ''),
+                item.get('overview', ''),
+                item.get('tagline', ''),
+                self._process_json_field(item.get('keywords', '[]')),
+                self._process_json_field(item.get('reviews', '[]'))
+            ]
+            
+            text_fields = [self._safe_text_conversion(field) for field in fields_to_process]
+            
+            combined_text = ' [SEP] '.join(filter(None, text_fields))
+            
+            if not combined_text.strip():
+                combined_text = "unknown content"
+            
+            with torch.no_grad():
+                inputs = self.tokenizer(
+                    combined_text,
+                    return_tensors='pt',
+                    truncation=True,
+                    max_length=512,
+                    padding=True
+                ).to(self.device)
+                
+                outputs = self.text_encoder(**inputs)
+                text_embedding = outputs.last_hidden_state.mean(dim=1)
+                
+            return text_embedding
+            
+        except Exception as e:
+            self.logger.error(f"Error in text encoding: {str(e)}")
+            return torch.zeros((1, 384), device=self.device)
+            
     def _encode_numerical_features(self, item: Dict) -> torch.Tensor:
         features = [
             float(item.get('popularity', 0)),
@@ -3376,20 +3270,25 @@ class RecommendationEngine:
         
         return encoded_metadata
 
-    def _process_json_field(self, json_str):
+    def _process_json_field(self, field: Union[str, List, Dict, None]) -> str:
         try:
-            if not json_str:
+            if field is None:
                 return ""
-            if isinstance(json_str, str):
-                data = json.loads(json_str)
-                if isinstance(data, list):
-                    return " ".join(str(item) for item in data)
-                return str(data)
-            return str(json_str)
-        except json.JSONDecodeError:
-            return json_str
-        except Exception:
+            if isinstance(field, (list, dict)):
+                return json.dumps(field)  
+            if isinstance(field, str):
+                try:
+                    parsed = json.loads(field)
+                    if isinstance(parsed, (list, dict)):
+                        return json.dumps(parsed)
+                    return str(parsed)
+                except json.JSONDecodeError:
+                    return field
+            return str(field)
+        except Exception as e:
+            self.logger.error(f"Error processing field: {field}, {str(e)}")
             return ""
+
 
     def _one_hot_genres(self, genres_str: Union[str, List]) -> torch.Tensor:
         standard_genres = [
@@ -3424,12 +3323,10 @@ class RecommendationEngine:
         return encoding
 
     def _update_knowledge_graph(self, media_id: int, rating: float, content_data: Dict) -> None:
-
         try:
             with self.graph_lock:
                 node_id = f"media_{media_id}"
                 print(f"Updating knowledge graph for {content_data.get('title', 'Unknown')}")
-                
                 
                 if node_id not in self.knowledge_graph['nodes']:
                     self.knowledge_graph['nodes'][node_id] = {
@@ -3445,19 +3342,16 @@ class RecommendationEngine:
                     
                 print(f"Updated node: {node_id}")
                 
-                
                 try:
                     similar_items = self._find_similar_items(content_data)
                     print(f"Found {len(similar_items)} similar items")
-                    
                     
                     for similar_id in similar_items:
                         similar_node_id = f"media_{similar_id}"
                         edge_tuple = (similar_node_id, 'similar_to')
                         
-                        
-                        if similar_node_id not in self.knowledge_graph['edges']:
-                            self.knowledge_graph['edges'][similar_node_id] = []
+                        self.knowledge_graph['edges'].setdefault(similar_node_id, [])
+                        self.knowledge_graph['edges'].setdefault(node_id, [])
                             
                         if edge_tuple not in self.knowledge_graph['edges'][node_id]:
                             self.knowledge_graph['edges'][node_id].append(edge_tuple)
@@ -3467,6 +3361,10 @@ class RecommendationEngine:
                 except Exception as e:
                     print(f"Error processing similar items: {e}")
                 
+        except Exception as e:
+            self.logger.error(f"Error updating knowledge graph: {str(e)}")
+            print(f"Error in knowledge graph update: {e}")
+            print(f"Traceback: {traceback.format_exc()}")            
         except Exception as e:
             self.logger.error(f"Error updating knowledge graph: {str(e)}")
             print(f"Error in knowledge graph update: {e}")
@@ -3955,6 +3853,154 @@ class RecommendationEngine:
             if 'sage_embedding' in locals(): del sage_embedding
             torch.cuda.empty_cache()
 
+class PosterDownloader(QObject):
+    def __init__(self):
+        super().__init__()
+        self.network_manager = QNetworkAccessManager()
+        self.network_manager.finished.connect(self._handle_network_response)
+        self._request_data = {}
+        self._request_counter = 0
+        self._lock = threading.Lock()
+        self._active_requests = set()
+        self._cache = {}
+        self._max_retries = 3
+        self._retry_delay = 1000
+        self.logger = logging.getLogger(__name__)
+
+    def download_poster(self, url: str, poster_label: QLabel) -> None:
+        try:
+            if url in self._cache:
+                pixmap = self._cache[url]
+                self._apply_pixmap(pixmap, poster_label)
+                return
+
+            if url in self._active_requests:
+                return
+
+            request = QNetworkRequest(QUrl(url))
+            request.setMaximumRedirectsAllowed(5)
+            request.setAttribute(QNetworkRequest.RedirectPolicyAttribute, 
+                              QNetworkRequest.NoLessSafeRedirectPolicy)
+
+            try:
+                request.setAttribute(QNetworkRequest.Attribute.User, poster_label)
+                using_attribute = True
+            except (AttributeError, TypeError):
+                with self._lock:
+                    self._request_counter += 1
+                    request_id = self._request_counter
+                    self._request_data[request_id] = {
+                        'label': poster_label,
+                        'retries': 0,
+                        'url': url
+                    }
+                    request.setHeader(QNetworkRequest.CustomHeader, str(request_id).encode())
+                using_attribute = False
+
+            self._active_requests.add(url)
+            self.network_manager.get(request)
+
+        except Exception as e:
+            self.logger.error(f"Error starting poster download: {str(e)}")
+            self._set_default_poster(poster_label)
+            self._active_requests.discard(url)
+
+    def _handle_network_response(self, reply: QNetworkReply) -> None:
+        url = reply.url().toString()
+        self._active_requests.discard(url)
+
+        try:
+            try:
+                poster_label = reply.request().attribute(QNetworkRequest.Attribute.User)
+                request_data = None
+            except (AttributeError, TypeError):
+                request_id = int(reply.request().rawHeader(b"CustomHeader"))
+                with self._lock:
+                    request_data = self._request_data.pop(request_id, None)
+                    poster_label = request_data['label'] if request_data else None
+
+            if not poster_label:
+                self.logger.error("Could not find poster label for network reply")
+                return
+
+            if reply.error() == QNetworkReply.NetworkError.NoError:
+                data = reply.readAll()
+                pixmap = QPixmap()
+                if pixmap.loadFromData(data):
+                    self._cache[url] = pixmap
+                    self._apply_pixmap(pixmap, poster_label)
+                else:
+                    self._handle_download_error(reply, request_data)
+            else:
+                self._handle_download_error(reply, request_data)
+
+        except Exception as e:
+            self.logger.error(f"Error handling network response: {str(e)}")
+            if 'poster_label' in locals() and poster_label:
+                self._set_default_poster(poster_label)
+        finally:
+            reply.deleteLater()
+
+    def _apply_pixmap(self, pixmap: QPixmap, label: QLabel) -> None:
+        try:
+            scaled_pixmap = pixmap.scaled(
+                300, 450,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            label.setPixmap(scaled_pixmap)
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        except Exception as e:
+            self.logger.error(f"Error applying pixmap: {str(e)}")
+            self._set_default_poster(label)
+
+    def _handle_download_error(self, reply: QNetworkReply, request_data: Optional[Dict]) -> None:
+        if not request_data:
+            self.logger.error("No request data available for retry")
+            return
+
+        if request_data['retries'] < self._max_retries:
+            request_data['retries'] += 1
+            QTimer.singleShot(
+                self._retry_delay * request_data['retries'],
+                lambda: self.download_poster(request_data['url'], request_data['label'])
+            )
+        else:
+            self.logger.error(f"Max retries exceeded: {reply.errorString()}")
+            self._set_default_poster(request_data['label'])
+
+    def _set_default_poster(self, label: QLabel) -> None:
+        try:
+            pixmap = QPixmap(300, 450)
+            pixmap.fill(QColor(200, 200, 200))
+
+            with QPainter(pixmap) as painter:
+                painter.setPen(QColor(100, 100, 100))
+                painter.setFont(QFont('Arial', 14))
+                painter.drawText(
+                    pixmap.rect(),
+                    Qt.AlignmentFlag.AlignCenter,
+                    "No\nPoster\nAvailable"
+                )
+
+            label.setPixmap(pixmap)
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        except Exception as e:
+            self.logger.error(f"Error setting default poster: {str(e)}")
+
+    def cleanup(self):
+        with self._lock:
+            self._request_data.clear()
+            self._request_counter = 0
+            self._active_requests.clear()
+            self._cache.clear()
+
+        if hasattr(self, 'network_manager'):
+            self.network_manager.finished.disconnect(self._handle_network_response)
+            self.network_manager.deleteLater()
+            self.network_manager = None
+
 class BackgroundTrainer(QThread):
     training_status = Signal(str)
     
@@ -3963,96 +4009,145 @@ class BackgroundTrainer(QThread):
         self.recommender = recommender
         self.db = db
         self.logger = logging.getLogger(__name__)
-        self._stop_flag = False
-        self._is_training = False
-        self.min_wait_time = 300  
-        self.max_wait_time = 3600  
+        self._stop_flag = threading.Event()
+        self._is_training = threading.Event()
+        self.min_wait_time = 300
+        self.max_wait_time = 3600
         self.batch_size = 32
+        self.preference_lock = threading.RLock()
+        self._batch_lock = threading.Lock()
+        self._embedding_lock = threading.Lock()
+        self._training_queue = deque(maxlen=1000)
+        self._queue_lock = threading.Lock()
             
     def run(self):
-        while not self._stop_flag:
+        while not self._stop_flag.is_set():
             try:
-                if self._stop_flag:
-                    break
-                    
-                if not self._is_training:
-                    self._is_training = True
+                if not self._is_training.is_set():
+                    self._is_training.set()
                     try:
                         self._run_training_cycle()
                     finally:
-                        self._is_training = False
+                        self._is_training.clear()
                 
-                if self._stop_flag:
+                if self._stop_flag.is_set():
                     break
                 
                 sleep_time = self._calculate_sleep_time()
                 self.training_status.emit(f"Sleeping for {sleep_time/60:.1f} minutes until next training cycle")
                 
-                sleep_interval = 0.1
-                intervals = int(sleep_time / sleep_interval)
-                
-                for _ in range(intervals):
-                    if self._stop_flag:
+                for _ in range(int(sleep_time * 10)):
+                    if self._stop_flag.is_set():
                         return
-                    time.sleep(sleep_interval)
+                    time.sleep(0.1)
                     
             except Exception as e:
                 self.logger.error(f"Error in background training: {str(e)}")
-                if self._stop_flag:
+                if self._stop_flag.is_set():
                     break
                 time.sleep(1)
+
+    def queue_item_for_training(self, item_data, priority=False):
+        with self._queue_lock:
+            if priority:
+                self._training_queue.appendleft(item_data)
+            else:
+                self._training_queue.append(item_data)
                 
-        self.training_status.emit("Background trainer stopped")
-                
-    def _calculate_sleep_time(self):
-        cursor = self.db.conn.cursor()
-        
-        
-        cursor.execute("SELECT COUNT(*) FROM media_items")
-        total_items = cursor.fetchone()[0]
-        
-        cursor.execute("""
-            SELECT COUNT(*) FROM embedding_cache 
-            WHERE last_updated > datetime('now', '-24 hours')
-        """)
-        recent_updates = cursor.fetchone()[0]
-        
-        
-        update_ratio = recent_updates / max(total_items, 1)
-        
-        
-        if update_ratio > 0.2:  
-            sleep_time = self.min_wait_time
-        elif update_ratio > 0.1:  
-            sleep_time = (self.min_wait_time + self.max_wait_time) / 2
-        else:  
-            sleep_time = self.max_wait_time
-            
-        return max(self.min_wait_time, min(sleep_time, self.max_wait_time))
-    
     def _run_training_cycle(self):
         self.training_status.emit("Starting background training cycle")
         
+        with self._batch_lock:
+            self._update_missing_embeddings()
         
-        self._update_missing_embeddings()
+        with self._batch_lock:
+            self._refresh_old_embeddings()
+            
+        with self._embedding_lock:
+            self._update_similarity_matrix()
+            
+        with self._batch_lock:
+            self._train_on_feedback()
+            
+        with self.preference_lock:
+            self._update_genre_preferences_from_feedback()
+            
+        self._process_training_queue()
         
-        
-        self._refresh_old_embeddings()
-        
-        
-        self._update_similarity_matrix()
-        
-        
-        self._train_on_feedback()
-        
-        
-        self._update_genre_preferences()
-        
-        self.training_status.emit("Completed background training cycle")
-        
+    def _process_training_queue(self):
+        while True:
+            with self._queue_lock:
+                if not self._training_queue:
+                    break
+                item_data = self._training_queue.popleft()
+            
+            try:
+                with self._batch_lock:
+                    self._train_single_item(item_data)
+            except Exception as e:
+                self.logger.error(f"Error training queued item: {str(e)}")
+
+    def _update_genre_preferences_from_feedback(self):
+        try:
+            cursor = self.db.conn.cursor()
+            cursor.execute("""
+                SELECT m.genres, f.rating 
+                FROM media_items m 
+                JOIN user_feedback f ON m.id = f.media_id
+                WHERE m.genres IS NOT NULL
+            """)
+            
+            for genres, rating in cursor.fetchall():
+                if genres and rating:
+                    try:
+                        if isinstance(genres, str):
+                            genres_list = json.loads(genres)
+                        else:
+                            genres_list = genres
+                        
+                        if isinstance(genres_list, list):
+                            with self.preference_lock:
+                                for genre in genres_list:
+                                    genre_name = genre.get('name') if isinstance(genre, dict) else str(genre)
+                                    if genre_name:
+                                        cursor.execute('''
+                                            INSERT INTO genre_preferences (genre, rating_sum, rating_count)
+                                            VALUES (?, ?, 1)
+                                            ON CONFLICT(genre) DO UPDATE SET
+                                                rating_sum = rating_sum + ?,
+                                                rating_count = rating_count + 1
+                                        ''', (genre_name, float(rating), float(rating)))
+                                self.db.conn.commit()
+                                
+                    except json.JSONDecodeError:
+                        continue
+                    except Exception as e:
+                        self.logger.error(f"Error processing genre preferences: {str(e)}")
+                        continue
+                        
+        except Exception as e:
+            self.logger.error(f"Error updating genre preferences: {str(e)}")
+
+    def _train_single_item(self, item_data):
+        try:
+            with self._embedding_lock:
+                embedding = None
+                try:
+                    embedding = self.recommender._compute_embedding(item_data)
+                    self.db.save_embedding(item_data['id'], embedding.cpu().numpy().tobytes())
+                finally:
+                    if embedding is not None:
+                        del embedding
+                        torch.cuda.empty_cache()
+                    
+            with self.preference_lock:
+                self._update_item_preferences(item_data)
+                    
+        except Exception as e:
+            self.logger.error(f"Error training item {item_data.get('id')}: {str(e)}")
+
     def _update_missing_embeddings(self):
         cursor = self.db.conn.cursor()
-        
         cursor.execute("""
             SELECT m.* FROM media_items m 
             LEFT JOIN embedding_cache e ON m.id = e.media_id
@@ -4067,16 +4162,19 @@ class BackgroundTrainer(QThread):
             self.training_status.emit(f"Generating embeddings for {len(items)} new items")
             
             for item in items:
+                if self._stop_flag.is_set():
+                    break
+                    
                 try:
-                    embedding = self.recommender._compute_embedding(item)
-                    self.db.save_embedding(item['id'], embedding.cpu().numpy().tobytes())
+                    with self._embedding_lock:
+                        embedding = self.recommender._compute_embedding(item)
+                        self.db.save_embedding(item['id'], embedding.cpu().numpy().tobytes())
                 except Exception as e:
                     self.logger.error(f"Error generating embedding for item {item['id']}: {str(e)}")
                     continue
-                    
+
     def _refresh_old_embeddings(self):
         cursor = self.db.conn.cursor()
-        
         cursor.execute("""
             SELECT m.* FROM media_items m 
             JOIN embedding_cache e ON m.id = e.media_id
@@ -4091,20 +4189,54 @@ class BackgroundTrainer(QThread):
             self.training_status.emit(f"Refreshing embeddings for {len(items)} items")
             
             for item in items:
+                if self._stop_flag.is_set():
+                    break
+                    
                 try:
-                    embedding = self.recommender._compute_embedding(item)
-                    self.db.save_embedding(item['id'], embedding.cpu().numpy().tobytes())
+                    with self._embedding_lock:
+                        embedding = self.recommender._compute_embedding(item)
+                        self.db.save_embedding(item['id'], embedding.cpu().numpy().tobytes())
                 except Exception as e:
                     self.logger.error(f"Error refreshing embedding for item {item['id']}: {str(e)}")
                     continue
-                    
+
+    def _calculate_sleep_time(self):
+        cursor = self.db.conn.cursor()
+        
+        try:
+            cursor.execute("SELECT COUNT(*) FROM media_items")
+            total_items = cursor.fetchone()[0]
+            
+            cursor.execute("""
+                SELECT COUNT(*) FROM embedding_cache 
+                WHERE last_updated > datetime('now', '-24 hours')
+            """)
+            recent_updates = cursor.fetchone()[0]
+            
+            update_ratio = recent_updates / max(total_items, 1)
+            
+            if update_ratio > 0.2: 
+                sleep_time = self.min_wait_time
+            elif update_ratio > 0.1:  
+                sleep_time = (self.min_wait_time + self.max_wait_time) / 2
+            else: 
+                sleep_time = self.max_wait_time
+                
+            return max(self.min_wait_time, min(sleep_time, self.max_wait_time))
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating sleep time: {e}")
+            return self.max_wait_time 
+        finally:
+            if cursor:
+                cursor.close()
+
     def _update_similarity_matrix(self):
         self.training_status.emit("Updating similarity matrix")
         self.recommender._update_similarity_matrix()
-        
+
     def _train_on_feedback(self):
         cursor = self.db.conn.cursor()
-        
         cursor.execute("""
             SELECT m.*, f.rating FROM media_items m
             JOIN user_feedback f ON m.id = f.media_id
@@ -4116,16 +4248,10 @@ class BackgroundTrainer(QThread):
         feedback_data = [dict(zip(columns, row)) for row in cursor.fetchall()]
         
         if feedback_data:
-            self.training_status.emit(f"Training on {len(feedback_data)} feedback items")
-            
-            
-            batches = [
-                feedback_data[i:i + self.batch_size] 
-                for i in range(0, len(feedback_data), self.batch_size)
-            ]
+            batches = [feedback_data[i:i + self.batch_size] for i in range(0, len(feedback_data), self.batch_size)]
             
             for batch in batches:
-                if self._stop_flag:
+                if self._stop_flag.is_set():
                     break
                     
                 try:
@@ -4134,51 +4260,25 @@ class BackgroundTrainer(QThread):
                 except Exception as e:
                     self.logger.error(f"Error training batch: {str(e)}")
                     continue
-                    
-    def _update_genre_preferences(self, genres: List[str], rating: float) -> None:
-        try:
-            if not isinstance(genres, list):
-                if isinstance(genres, str):
-                    try:
-                        genres = json.loads(genres)
-                    except json.JSONDecodeError:
-                        genres = [genres]
-                else:
-                    genres = [str(genres)]
-        
-            valid_genres = [
-                genre.get('name') if isinstance(genre, dict) else str(genre)
-                for genre in genres
-                if genre is not None
-            ]
+
+    def _update_item_preferences(self, item_data):
+        if not isinstance(item_data, dict):
+            return
             
-            with self.preference_lock:
-                cursor = self.db.conn.cursor()
-                
-                for genre in valid_genres:
-                    cursor.execute('''
-                        INSERT INTO genre_preferences (genre, rating_sum, rating_count)
-                        VALUES (?, ?, 1)
-                        ON CONFLICT(genre) DO UPDATE SET
-                            rating_sum = rating_sum + ?,
-                            rating_count = rating_count + 1
-                    ''', (genre, float(rating), float(rating)))
-                        
-                self.db.conn.commit()
-                print(f"Updated preferences for genres: {genres}")
-                
+        try:
+            genres = self._process_json_field(item_data.get('genres', '[]'))
+            if genres:
+                self._update_genre_preferences(genres, item_data.get('vote_average', 5.0))
         except Exception as e:
-            self.logger.error(f"Error updating genre preferences: {str(e)}")
-            print(f"Error in genre preference update: {e}")
-                
+            self.logger.error(f"Error updating preferences: {str(e)}")
+
     def stop(self):
-        self._stop_flag = True
+        self._stop_flag.set()
         
         start_time = time.time()
-        while self.isRunning() and (time.time() - start_time) < 2:
-            QApplication.processEvents()
+        while self.isRunning() and (time.time() - start_time) < 5:
             time.sleep(0.1)
-            
+        
         if self.isRunning():
             self.terminate()
             self.wait(1000)
@@ -4195,15 +4295,17 @@ class SimilarityComputationThread(QThread):
         self._stop_flag = False
 
     def run(self):
+        reference_embedding = None
+        reference_cpu = None
         try:
             similarities = []
             batch_size = 5
 
-            
-            reference_embedding = self.engine._compute_embedding(self.reference_item)
-            reference_embedding = reference_embedding.view(-1)
-            reference_embedding = F.normalize(reference_embedding, p=2, dim=0)
-            reference_cpu = reference_embedding.cpu()
+            with torch.no_grad():
+                reference_embedding = self.engine._compute_embedding(self.reference_item)
+                reference_embedding = reference_embedding.view(-1)
+                reference_embedding = F.normalize(reference_embedding, p=2, dim=0)
+                reference_cpu = reference_embedding.cpu()
 
             for i in range(0, len(self.candidates), batch_size):
                 if self._stop_flag:
@@ -4216,6 +4318,8 @@ class SimilarityComputationThread(QThread):
                     if self._stop_flag:
                         break
 
+                    other_embedding = None
+                    other_cpu = None
                     try:
                         with torch.no_grad():
                             other_embedding = self.engine._compute_embedding(item)
@@ -4226,28 +4330,33 @@ class SimilarityComputationThread(QThread):
                             similarity = torch.dot(reference_cpu, other_cpu).item()
                             batch_similarities.append((item['id'], item['title'], similarity))
 
-                            del other_embedding
-                            del other_cpu
-
                     except Exception as e:
                         self.engine.logger.error(f"Error processing item {item['id']}: {e}")
                         continue
                     finally:
+                        if other_embedding is not None:
+                            del other_embedding
+                        if other_cpu is not None:
+                            del other_cpu
                         torch.cuda.empty_cache()
 
                 similarities.extend(batch_similarities)
                 progress = f"Computing similarities: {min(i + batch_size, len(self.candidates))}/{len(self.candidates)}"
                 self.progress.emit(progress)
 
-            
             if not self._stop_flag:
                 self.engine._store_similarities(self.reference_item['id'], similarities)
 
         except Exception as e:
             self.engine.logger.error(f"Error in similarity computation: {str(e)}")
         finally:
+            if reference_embedding is not None:
+                del reference_embedding
+            if reference_cpu is not None:
+                del reference_cpu
+            torch.cuda.empty_cache()
             self.finished.emit()
-
+            
     def stop(self):
         self._stop_flag = True
 
