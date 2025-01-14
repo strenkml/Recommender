@@ -5,6 +5,7 @@ This is a comprehensive recommendation system that integrates with Plex, TMDB, a
 ### Notes: 
 ### I'll be compiling a executable in the near future for release, which should handle all the prereqs and dependancies.
 ### Until then, consider this a work in progress in a pre-alpha state.
+### Also, I know the GUI is ugly. I'll refine it as I finish other things. Functionality over form at the moment.
 
 ## Table of Contents
 
