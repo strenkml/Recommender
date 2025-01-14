@@ -19,18 +19,19 @@ from typing import Optional, Dict, Any, Tuple, List, Union, Set
 from collections import defaultdict, deque
 from logging.handlers import RotatingFileHandler
 
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTextEdit, QPushButton,
-    QGroupBox, QFormLayout, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QAbstractItemView, QDialog,
-    QRadioButton, QDialogButtonBox, QButtonGroup
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
+    QTextEdit, QPushButton, QGroupBox, QFormLayout, QLineEdit, QListWidget, 
+    QListWidgetItem, QMessageBox, QAbstractItemView, QDialog, QRadioButton, 
+    QDialogButtonBox, QButtonGroup
 )
-from PyQt5.QtCore import (
-    Qt, QTimer, QThread, pyqtSignal, QUrl, QObject, QEventLoop, QSize
+from PySide6.QtCore import (
+    Qt, QTimer, QThread, Signal, QUrl, QObject, QEventLoop, QSize
 )
-from PyQt5.QtGui import (
+from PySide6.QtGui import (
     QPalette, QColor, QPixmap, QPainter, QFont, QIcon
 )
-from PyQt5.QtNetwork import (
+from PySide6.QtNetwork import (
     QNetworkAccessManager, QNetworkRequest, QNetworkReply
 )
 
@@ -1103,9 +1104,12 @@ class MediaRecommenderApp(QMainWindow):
         QTimer.singleShot(24 * 60 * 60 * 1000, self.schedule_cache_updates)
                        
     def init_ui(self):
+        self.setWindowTitle("Plex Recommender")
+        self.setMinimumSize(1200, 800)
+        
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
-       
+        
         self.init_movies_tab()
         self.init_tv_tab()
         self.init_config_tab()
@@ -1121,36 +1125,43 @@ class MediaRecommenderApp(QMainWindow):
     def create_media_tab(self, media_type):
         tab_widget = QWidget()
         layout = QVBoxLayout()
-       
+        
         media_layout = QHBoxLayout()
-       
+        
         poster_label = QLabel()
         poster_label.setFixedSize(300, 450)
+        poster_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         media_layout.addWidget(poster_label)
-       
+        
         details_layout = QVBoxLayout()
+        
         title_label = QLabel()
         title_label.setStyleSheet("font-size: 24px; font-weight: bold;")
+        title_label.setTextFormat(Qt.TextFormat.PlainText)
+        title_label.setWordWrap(True)
         details_layout.addWidget(title_label)
-       
+        
         year_runtime_label = QLabel()
+        year_runtime_label.setTextFormat(Qt.TextFormat.PlainText)
         details_layout.addWidget(year_runtime_label)
-       
+        
         genres_label = QLabel()
+        genres_label.setTextFormat(Qt.TextFormat.PlainText)
+        genres_label.setWordWrap(True)
         details_layout.addWidget(genres_label)
-       
+        
         summary_text = QTextEdit()
         summary_text.setReadOnly(True)
+        summary_text.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         details_layout.addWidget(summary_text)
-       
+        
         media_layout.addLayout(details_layout)
         layout.addLayout(media_layout)
-       
+        
         rating_layout = QHBoxLayout()
-       
         rating_label = QLabel("Rate (1-10):")
         rating_layout.addWidget(rating_label)
-       
+        
         rating_buttons = QButtonGroup()
         for i in range(10):
             rating = i + 1
@@ -1159,11 +1170,11 @@ class MediaRecommenderApp(QMainWindow):
             button.clicked.connect(lambda checked, r=rating: self.submit_rating(r, media_type))
             rating_layout.addWidget(button)
             rating_buttons.addButton(button)
-       
+        
         layout.addLayout(rating_layout)
-       
+        
         tab_widget.setLayout(layout)
-       
+        
         self.media_widgets[media_type] = {
             'poster_label': poster_label,
             'title_label': title_label,
@@ -1172,7 +1183,7 @@ class MediaRecommenderApp(QMainWindow):
             'summary_text': summary_text,
             'current_item_id': None
         }
-       
+        
         return tab_widget
        
     def init_config_tab(self):
@@ -1396,7 +1407,7 @@ class MediaRecommenderApp(QMainWindow):
 
 
     def _update_poster_image(self, item: Dict, poster_label: QLabel) -> None:
-        if not item.get('poster_url'):
+        if not item or not item.get('poster_url'):
             self._set_default_poster(poster_label)
             return
 
@@ -1411,7 +1422,7 @@ class MediaRecommenderApp(QMainWindow):
                 self.network_manager.finished.connect(self._handle_network_response)
 
             request = QNetworkRequest(QUrl(url))
-            request.setAttribute(QNetworkRequest.User, poster_label)
+            request.setAttribute(QNetworkRequest.Attribute.User, poster_label)
             self.network_manager.get(request)
 
         except Exception as e:
@@ -1419,20 +1430,21 @@ class MediaRecommenderApp(QMainWindow):
             self._set_default_poster(poster_label)
 
     def _handle_network_response(self, reply: QNetworkReply) -> None:
-        poster_label = reply.request().attribute(QNetworkRequest.User)
-       
+        poster_label = reply.request().attribute(QNetworkRequest.Attribute.User)
+        
         try:
-            if reply.error() == QNetworkReply.NoError:
+            if reply.error() == QNetworkReply.NetworkError.NoError:
                 data = reply.readAll()
-               
+                
                 pixmap = QPixmap()
                 if pixmap.loadFromData(data):
                     scaled_pixmap = pixmap.scaled(
                         300, 450,
-                        Qt.KeepAspectRatio,
-                        Qt.SmoothTransformation
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation
                     )
                     poster_label.setPixmap(scaled_pixmap)
+                    poster_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 else:
                     self._set_default_poster(poster_label)
             else:
@@ -1468,21 +1480,21 @@ class MediaRecommenderApp(QMainWindow):
             self.logger.error(f"Error constructing poster URL: {str(e)}")
             return None
 
-    def _set_default_poster(self, label: QLabel) -> None:
+    def _set_default_poster(self, label):
         try:
             pixmap = QPixmap(300, 450)
-            pixmap.fill(QColor(200, 200, 200))
-
-            painter = QPainter(pixmap)
-            painter.setPen(QColor(100, 100, 100))
-            painter.setFont(QFont('Arial', 14))
-            painter.drawText(pixmap.rect(), Qt.AlignCenter, "No\nPoster\nAvailable")
-            painter.end()
-
+            pixmap.fill(QColor(40, 40, 40)) 
+            
+            with QPainter(pixmap) as painter:
+                painter.setPen(QColor(200, 200, 200))
+                painter.setFont(QFont('Arial', 14))
+                painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, "No\nPoster\nAvailable")
+            
             label.setPixmap(pixmap)
-
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            
         except Exception as e:
-            self.logger.error(f"Error setting default poster: {str(e)}")
+            self.logger.error(f"Error setting default poster: {e}")
 
 
     def _set_default_poster(self, label):
@@ -1580,19 +1592,11 @@ class MediaRecommenderApp(QMainWindow):
                         self.background_trainer.terminate()
                         self.background_trainer.wait(1000)
                     
-                    if self.background_trainer.isRunning():
-                        print("Force killing background trainer thread")
-                        self.background_trainer.terminate()
-                        self.background_trainer = None
-                    else:
-                        self.background_trainer = None
+                    self.background_trainer = None
                         
                 except Exception as e:
                     print(f"Error stopping background trainer: {e}")
                     self.background_trainer = None
-                
-                status_label.setText("Background trainer stopped")
-                QApplication.processEvents()
 
             if self.recommender:
                 status_label.setText("Cleaning up recommendation engine...")
@@ -1656,7 +1660,7 @@ class MediaRecommenderApp(QMainWindow):
             error_dialog.exec_()
             
             event.accept()
-            
+
     def update_progress(self, message):
         self.progress_text.append(message)
        
@@ -1919,9 +1923,9 @@ class GraphSageNetwork(nn.Module):
         return x
 
 class SimilarityWorker(QObject):
-    progress = pyqtSignal(str)
-    finished = pyqtSignal()
-    error = pyqtSignal(str)
+    progress = Signal(str)
+    finished = Signal()
+    error = Signal(str)
 
     def __init__(self, engine, reference_item, candidates):
         super().__init__()
@@ -3952,7 +3956,7 @@ class RecommendationEngine:
             torch.cuda.empty_cache()
 
 class BackgroundTrainer(QThread):
-    training_status = pyqtSignal(str)
+    training_status = Signal(str)
     
     def __init__(self, recommender, db):
         super().__init__()
@@ -4180,8 +4184,8 @@ class BackgroundTrainer(QThread):
             self.wait(1000)
 
 class SimilarityComputationThread(QThread):
-    progress = pyqtSignal(str)
-    finished = pyqtSignal()
+    progress = Signal(str)
+    finished = Signal()
 
     def __init__(self, engine, reference_item, candidates):
         super().__init__()
@@ -4935,7 +4939,7 @@ class MediaScanner:
         }
 
 class ScanThread(QThread):
-    progress = pyqtSignal(str)
+    progress = Signal(str)
     
     def __init__(self, scanner, library_names):
         super().__init__()
@@ -5038,33 +5042,66 @@ class ScanThread(QThread):
         if self.loop and not self.loop.is_closed():
             self.loop.close()
 
-if __name__ == '__main__':
-    app = QApplication(sys.argv)
-    app.setStyle('Fusion')
-    
-    
+def setup_theme(app: QApplication):
     palette = QPalette()
-    palette.setColor(QPalette.Window, QColor(53, 53, 53))
-    palette.setColor(QPalette.WindowText, Qt.white)
-    palette.setColor(QPalette.Base, QColor(25, 25, 25))
-    palette.setColor(QPalette.AlternateBase, QColor(53, 53, 53))
-    palette.setColor(QPalette.ToolTipBase, Qt.white)
-    palette.setColor(QPalette.ToolTipText, Qt.white)
-    palette.setColor(QPalette.Text, Qt.white)
-    palette.setColor(QPalette.Button, QColor(53, 53, 53))
-    palette.setColor(QPalette.ButtonText, Qt.white)
-    palette.setColor(QPalette.BrightText, Qt.red)
-    palette.setColor(QPalette.Link, QColor(42, 130, 218))
-    palette.setColor(QPalette.Highlight, QColor(42, 130, 218))
-    palette.setColor(QPalette.HighlightedText, Qt.black)
+    
+    palette.setColor(QPalette.ColorRole.Window, QColor(53, 53, 53))
+    palette.setColor(QPalette.ColorRole.WindowText, Qt.GlobalColor.white)
+    palette.setColor(QPalette.ColorRole.Base, QColor(25, 25, 25))
+    palette.setColor(QPalette.ColorRole.AlternateBase, QColor(53, 53, 53))
+    
+    palette.setColor(QPalette.ColorRole.Text, Qt.GlobalColor.white)
+    palette.setColor(QPalette.ColorRole.BrightText, Qt.GlobalColor.red)
+    
+    palette.setColor(QPalette.ColorRole.Button, QColor(53, 53, 53))
+    palette.setColor(QPalette.ColorRole.ButtonText, Qt.GlobalColor.white)
+    
+    palette.setColor(QPalette.ColorRole.Highlight, QColor(42, 130, 218))
+    palette.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.black)
+    
+    palette.setColor(QPalette.ColorRole.ToolTipBase, Qt.GlobalColor.white)
+    palette.setColor(QPalette.ColorRole.ToolTipText, Qt.GlobalColor.white)
+    
+    palette.setColor(QPalette.ColorRole.Link, QColor(42, 130, 218))
     
     app.setPalette(palette)
     
+    app.setStyle('Fusion')
     
-    window = MediaRecommenderApp()
-    window.show()
+    font = app.font()
+    font.setPointSize(10)
+    app.setFont(font)
     
+def main():
+    app = QApplication([])
     
-    app.aboutToQuit.connect(Database.get_instance().close)
+    setup_theme(app)
     
-    sys.exit(app.exec_())
+    try:
+        window = MediaRecommenderApp()
+        window.show()
+        
+        app.aboutToQuit.connect(lambda: cleanup_application(window))
+        
+        return app.exec()
+        
+    except Exception as e:
+        QMessageBox.critical(
+            None,
+            "Application Error",
+            f"An error occurred while starting the application:\n\n{str(e)}"
+        )
+        return 1
+
+def cleanup_application(window):
+    try:
+        Database.get_instance().close()
+        
+        if hasattr(window, 'cleanup'):
+            window.cleanup()
+        
+    except Exception as e:
+        print(f"Error during application cleanup: {e}")
+
+if __name__ == '__main__':
+    sys.exit(main())
