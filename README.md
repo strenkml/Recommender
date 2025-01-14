@@ -1,4 +1,4 @@
-# Plex Recommend 
+# Recommend For Plex
 
 This is a comprehensive recommendation system that integrates with Plex, TMDB, and TVDB to provide movie and TV show recommendations. It uses PySide6 for the GUI, several PyTorch-based encoders and neural networks for generating embeddings, a knowledge graph for content relationships, and an SQLite database for storing media items, embeddings, preferences, and feedback.
 
@@ -237,7 +237,7 @@ When a user provides feedback (rating >= 1), the system:
 
 ### Logging
 
-- The main logger writes to a rotating file in the system temp folder (e.g., `plex_recommender.log`).
+- The main logger writes to a rotating file in the system temp folder (e.g., `recommender_for_plex.log`).
 - You’ll see debug and info messages in the console and logs about scanning, embeddings, training, etc.
 
 ### Background Trainer Details
