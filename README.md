@@ -4,6 +4,8 @@ This is a comprehensive recommendation system that integrates with Plex, TMDB, a
 
 This is designed to be very good at learning, but still light enough to run on a laptop using only CPU.
 
+The instructions are below. You can either run main.py directory or run the compiled EXE in the releases section.
+
 ![{832FAD55-DB9E-4548-AF46-EBEE23BC66E5}](https://github.com/user-attachments/assets/e4bd1173-701f-4714-9da7-a1b416df40a3)
 
 
