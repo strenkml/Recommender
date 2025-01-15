@@ -14,10 +14,7 @@ This is designed to be very good at learning, but still light enough to run on a
 
 
 
-### Notes: 
-### I'll be compiling a executable in the near future for release, which should handle all the prereqs and dependancies.
-### Until then, consider this a work in progress in a pre-alpha state.
-
+## Please consider this a evolving WIP. I'll do my best to ensure it is stable before any publishing but report any issues you encounter.
 
 ## Table of Contents
 
@@ -104,6 +101,17 @@ If you do not have a `requirements.txt`, here is a non-exhaustive list of the ma
 Note: Depending on your environment, some additional PyTorch Geometric dependencies (e.g., `torch-scatter`, `torch-sparse`) may be required separately. Refer to the [PyTorch Geometric installation guide](https://pytorch-geometric.readthedocs.io/en/latest/notes/installation.html) for your specific OS and CUDA version.
 
 ### Running the Application
+
+#### Recommended
+
+Use the pre-compiled executable available in the **Releases** section of this repository. This option simplifies the setup process by bundling all necessary dependencies.
+
+1. Download the latest release executable from the [Releases](#) section.
+2. Run the executable to start the application.
+
+#### Advanced
+
+For users who prefer to run the application from the source code, follow the instructions below:
 
 1. **Clone** or **download** this repository.
 2. **Navigate** into the project folder.
