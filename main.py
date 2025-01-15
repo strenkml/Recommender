@@ -1561,11 +1561,27 @@ class MediaRecommenderApp(QMainWindow):
             runtime_str = f"{int(runtime) // 60} min" if str(runtime).isdigit() else runtime
             year_runtime = ' | '.join(filter(None, [str(year), runtime_str]))
             widgets['year_runtime_label'].setText(year_runtime)
-            
-            genres = item.get('genres', [])
+
+            genres = item.get('genres', '')
             if isinstance(genres, str):
-                genres = json.loads(genres) if genres.startswith('[') else genres.split(',')
-            genres_str = ", ".join(str(genre).strip() for genre in genres if genre)
+                try:
+                    genres = json.loads(genres)
+                except json.JSONDecodeError:
+                    genres = [genres]
+                    
+            if isinstance(genres, list):
+                genre_names = []
+                for genre in genres:
+                    if isinstance(genre, dict):
+                        name = genre.get('name', '')
+                        if name:
+                            genre_names.append(name)
+                    else:
+                        genre_names.append(str(genre))
+                genres_str = ", ".join(genre_names)
+            else:
+                genres_str = str(genres)
+                
             widgets['genres_label'].setText(genres_str)
             
             summary = item.get('summary', 'No summary available')
@@ -1584,7 +1600,7 @@ class MediaRecommenderApp(QMainWindow):
             widgets['genres_label'].setText("")
             widgets['summary_text'].setPlainText(f"Error loading item: {str(e)}")
             self.poster_downloader._set_default_poster(widgets['poster_label'])
-                
+                        
     def show_next_recommendation(self, media_type):
         print(f"\nFetching next recommendation for {media_type}")
         try:
