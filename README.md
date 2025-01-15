@@ -6,12 +6,10 @@ This is designed to be very good at learning, but still light enough to run on a
 
 The instructions are below. You can either run main.py directory or run the compiled EXE in the releases section.
 
-![{832FAD55-DB9E-4548-AF46-EBEE23BC66E5}](https://github.com/user-attachments/assets/e4bd1173-701f-4714-9da7-a1b416df40a3)
+![{E5F47FA3-837B-49CC-8363-4999D31C9F64}](https://github.com/user-attachments/assets/7c5710dd-be45-4bb6-9770-562095d091f5)
 
 
-![{CDB8CC61-D856-4C66-AA15-1E646C77BA4F}](https://github.com/user-attachments/assets/da250826-1501-4f0b-bf6e-eaa5e4436c40)
-
-
+![{36003507-4CD2-47BC-A406-A4D89EB7E54E}](https://github.com/user-attachments/assets/c332b13d-593f-4e82-a878-f1d788921c63)
 
 
 
