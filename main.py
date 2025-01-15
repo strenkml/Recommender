@@ -131,7 +131,8 @@ class Database:
                         episode_count INTEGER,
                         first_air_date TEXT,
                         last_air_date TEXT,
-                        score_adjustment REAL DEFAULT 0
+                        is_blocked INTEGER DEFAULT 0,
+                        last_recommended TIMESTAMP
                     )
                 ''')
 
@@ -173,6 +174,26 @@ class Database:
                         FOREIGN KEY (item2_id) REFERENCES media_items (id)
                     )
                 ''')
+
+                cursor.execute('''
+                    SELECT COUNT(*) FROM pragma_table_info('media_items') 
+                    WHERE name='last_recommended'
+                ''')
+                if cursor.fetchone()[0] == 0:
+                    cursor.execute('''
+                        ALTER TABLE media_items 
+                        ADD COLUMN last_recommended TIMESTAMP
+                    ''')
+
+                cursor.execute('''
+                    SELECT COUNT(*) FROM pragma_table_info('media_items') 
+                    WHERE name='is_blocked'
+                ''')
+                if cursor.fetchone()[0] == 0:
+                    cursor.execute('''
+                        ALTER TABLE media_items 
+                        ADD COLUMN is_blocked INTEGER DEFAULT 0
+                    ''')
 
                 self.conn.commit()
             finally:
@@ -1084,7 +1105,7 @@ class MediaRecommenderApp(QMainWindow):
         super().__init__()
         self.setWindowTitle("Recommend For Plex")
         self.setMinimumSize(1200, 800)
-       
+    
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logging.INFO)
         temp_dir = tempfile.gettempdir()
@@ -1093,19 +1114,22 @@ class MediaRecommenderApp(QMainWindow):
         log_handler = RotatingFileHandler(log_file_path, maxBytes=10*1024*1024, backupCount=5)
         log_handler.setFormatter(log_formatter)
         self.logger.addHandler(log_handler)
-       
+    
         self.media_widgets = {}
         self.background_trainer = None
-       
+        self.skipped_items = {'movie': set(), 'show': set()}
+        self.blocked_items = set()
+        self._load_blocked_items()
+    
         self.init_ui()
-       
+    
         self.load_config()
-       
+    
         self.db = None
         self.recommender = None
         self.media_scanner = None
         self.poster_downloader = PosterDownloader()
-       
+    
         QTimer.singleShot(0, self.init_background_components)
 
     def init_background_components(self):
@@ -1261,20 +1285,38 @@ class MediaRecommenderApp(QMainWindow):
         media_layout.addLayout(details_layout)
         layout.addLayout(media_layout)
         
-        rating_layout = QHBoxLayout()
+        rating_container = QHBoxLayout()
+        rating_container.addStretch(1)
+        
         rating_label = QLabel("Rate (1-10):")
-        rating_layout.addWidget(rating_label)
+        rating_container.addWidget(rating_label)
         
         rating_buttons = QButtonGroup()
         for i in range(10):
             rating = i + 1
             button = QPushButton(str(rating))
             button.setFixedWidth(40)
-            button.clicked.connect(lambda checked, r=rating: self.submit_rating(r, media_type))
-            rating_layout.addWidget(button)
+            def make_callback(r):
+                return lambda checked: self.submit_rating(r, media_type)
+            button.clicked.connect(make_callback(rating))
+            rating_container.addWidget(button)
             rating_buttons.addButton(button)
         
-        layout.addLayout(rating_layout)
+        rating_container.addStretch(1)
+        layout.addLayout(rating_container)
+        
+        button_layout = QHBoxLayout()
+        skip_button = QPushButton("Skip")
+        skip_button.clicked.connect(lambda: self.skip_item(media_type))
+        skip_button.setFixedWidth(100)
+        never_button = QPushButton("Block Item")
+        never_button.clicked.connect(lambda: self.never_show_item(media_type))
+        never_button.setFixedWidth(100)
+        button_layout.addStretch()
+        button_layout.addWidget(skip_button)
+        button_layout.addWidget(never_button)
+        button_layout.addStretch()
+        layout.addLayout(button_layout)
         
         tab_widget.setLayout(layout)
         
@@ -1288,7 +1330,7 @@ class MediaRecommenderApp(QMainWindow):
         }
         
         return tab_widget
-       
+                
     def init_config_tab(self):
         config_widget = QWidget()
         layout = QVBoxLayout()
@@ -1337,6 +1379,11 @@ class MediaRecommenderApp(QMainWindow):
         reset_button.setToolTip("Clear all ratings and start fresh")
         reset_button.clicked.connect(self.reset_model)
         model_layout.addWidget(reset_button)
+
+        reset_blocked_button = QPushButton("Reset Blocked Items")
+        reset_blocked_button.setToolTip("Clear all never show/blocked items")
+        reset_blocked_button.clicked.connect(self.reset_blocked_items)
+        model_layout.addWidget(reset_blocked_button)
 
         scan_button = QPushButton("Scan Libraries")
         scan_button.clicked.connect(self.scan_libraries)
@@ -1423,6 +1470,67 @@ class MediaRecommenderApp(QMainWindow):
             print(f"Error parsing configuration file: {e}")
         except Exception as e:
             print(f"Error loading configuration: {e}")
+
+    def skip_item(self, media_type):
+        current_id = self.media_widgets[media_type]['current_item_id']
+        if current_id is not None:
+            self.skipped_items[media_type].add(current_id)
+            print(f"Added {current_id} to skipped items for {media_type}")
+            self.show_next_recommendation(media_type)
+
+    def never_show_item(self, media_type):
+        current_id = self.media_widgets[media_type]['current_item_id']
+        if current_id is not None:
+            try:
+                cursor = self.db.conn.cursor()
+                cursor.execute('UPDATE media_items SET is_blocked = 1 WHERE id = ?', (current_id,))
+                self.db.conn.commit()
+                self.blocked_items.add(current_id)
+                print(f"Blocked item {current_id}")
+                self.show_next_recommendation(media_type)
+            except Exception as e:
+                self.logger.error(f"Error blocking item: {str(e)}")
+                self.show_error("Error", f"Failed to block item: {str(e)}")
+                
+    def _load_blocked_items(self):
+        try:
+            cursor = self.db.conn.cursor()
+            cursor.execute('SELECT id FROM media_items WHERE is_blocked = 1')
+            blocked = cursor.fetchall()
+            self.blocked_items = {row[0] for row in blocked}
+        except Exception as e:
+            self.logger.error(f"Error loading blocked items: {str(e)}")
+            self.blocked_items = set()
+
+    def reset_blocked_items(self):
+        reply = QMessageBox.question(
+            self,
+            "Reset Blocked Items",
+            "Are you sure you want to clear all blocked items?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            try:
+                cursor = self.db.conn.cursor()
+                cursor.execute('''
+                    UPDATE media_items 
+                    SET is_blocked = 0,
+                        last_recommended = NULL
+                    WHERE is_blocked = 1
+                ''')
+                self.db.conn.commit()
+                
+                self.blocked_items.clear()
+                
+                self.show_next_recommendation('movie')
+                self.show_next_recommendation('show')
+                
+                QMessageBox.information(self, "Success", "All blocked items have been cleared and recommendations refreshed")
+            except Exception as e:
+                self.logger.error(f"Error resetting blocked items: {str(e)}")
+                QMessageBox.critical(self, "Error", f"Failed to reset blocked items: {str(e)}")
 
     def display_item(self, item: Optional[Dict], media_type: str) -> None:
         print(f"\nAttempting to display item for {media_type}")
@@ -1605,22 +1713,28 @@ class MediaRecommenderApp(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to scan libraries: {str(e)}")
 
     def _on_scan_completed(self):
-        self.progress_text.append("Scan completed!")
-        if self.recommender:
-            self.recommender.knowledge_graph = self.recommender._initialize_knowledge_graph()
-    
-        QTimer.singleShot(1000, self._load_initial_recommendations)
+        try:
+            self.progress_text.append("Scan completed!")
+            
+            if self.recommender:
+                self.recommender.knowledge_graph = self.recommender._initialize_knowledge_graph()
+                
+            QTimer.singleShot(0, self._refresh_recommendations)
+        except Exception as e:
+            self.logger.error(f"Error in scan completion: {str(e)}")
+            self.progress_text.append(f"Error refreshing recommendations: {str(e)}")
 
     def show_error_notification(self, message: str):
         QMessageBox.warning(self, "Training Error", message)
 
     def _refresh_recommendations(self):
         try:
-            self.show_next_recommendation('movie')
-            self.show_next_recommendation('show')
+            self.display_item(self.recommender.get_next_recommendation('movie'), 'movie')
+            self.display_item(self.recommender.get_next_recommendation('show'), 'show')
         except Exception as e:
-            self.logger.error(f"Error refreshing recommendations: {e}")
-        
+            self.logger.error(f"Error refreshing recommendations: {str(e)}")
+            self.progress_text.append(f"Error refreshing recommendations: {str(e)}")
+            
     def closeEvent(self, event):
         print("\nInitiating application shutdown...")
         
@@ -1672,18 +1786,26 @@ class MediaRecommenderApp(QMainWindow):
             "• Clear all your ratings\n"
             "• Reset learning patterns\n"
             "• Clear cached embeddings\n"
+            "• Reset all last recommended timestamps\n"
             "• Start fresh with no preferences\n\n"
             "This cannot be undone.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
-       
+        
         if reply == QMessageBox.Yes:
             try:
                 result = self.recommender.reset_model()
+                
+                cursor = self.db.conn.cursor()
+                cursor.execute('UPDATE media_items SET last_recommended = NULL')
+                self.db.conn.commit()
+                
                 QMessageBox.information(self, "Success", result)
+                
                 self.show_next_recommendation('movie')
                 self.show_next_recommendation('show')
+                
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to reset system: {str(e)}")
 
@@ -2013,6 +2135,60 @@ class SimilarityWorker(QObject):
     def stop(self):
         self._stop = True
 
+class JSONUtils:
+    @staticmethod
+    def process_json_field(field):
+        try:
+            if field is None:
+                return ""
+            if isinstance(field, (list, dict)):
+                return json.dumps(field)
+            if isinstance(field, str):
+                try:
+                    parsed = json.loads(field)
+                    if isinstance(parsed, (list, dict)):
+                        return json.dumps(parsed)
+                    return str(parsed)
+                except json.JSONDecodeError:
+                    return field
+            return str(field)
+        except Exception as e:
+            print(f"Error processing field: {field}, {str(e)}")
+            return ""
+            
+    @staticmethod
+    def extract_list(value):
+        try:
+            if not value:
+                return set()
+                
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except json.JSONDecodeError:
+                    return {value}
+            
+            if isinstance(value, dict):
+                return {str(value.get('name', value.get('id', '')))}
+                
+            if isinstance(value, list):
+                result = set()
+                for item in value:
+                    if isinstance(item, dict):
+                        name = item.get('name', item.get('id', ''))
+                        if name:
+                            result.add(str(name))
+                    else:
+                        if item:
+                            result.add(str(item))
+                return result
+                
+            return {str(value)}
+            
+        except Exception as e:
+            print(f"Error extracting list: {e}")
+            return set()
+
 class RecommendationEngine:
     def __init__(self, db):
         self.db = db
@@ -2025,6 +2201,18 @@ class RecommendationEngine:
         self.similarity_matrix = None
         self.last_matrix_update = None
         self.tensor_lock = threading.Lock()
+        self.skipped_items = {'movie': set(), 'show': set()} 
+        self.blocked_items = set()
+        self.json_utils = JSONUtils()
+        
+        try:
+            cursor = self.db.conn.cursor()
+            cursor.execute('SELECT id FROM media_items WHERE is_blocked = 1')
+            blocked = cursor.fetchall()
+            self.blocked_items = {row[0] for row in blocked}
+        except Exception as e:
+            self.logger.error(f"Error loading blocked items: {str(e)}")
+            self.blocked_items = set()
 
         try:
             nltk.download('wordnet', quiet=True)
@@ -2418,34 +2606,40 @@ class RecommendationEngine:
             else:
                 exploration_rate = 0.02
                 
+            base_query = '''
+                SELECT id 
+                FROM media_items 
+                WHERE type = ?
+                AND is_blocked = 0
+                AND id NOT IN (SELECT media_id FROM user_feedback)
+                AND id NOT IN (
+                    SELECT id FROM media_items 
+                    WHERE last_recommended > datetime('now', '-2 hours')
+                )
+            '''
+                
             if random.random() < exploration_rate:
-                cursor.execute('''
+                cursor.execute(f'''
                     WITH FeedbackGenres AS (
                         SELECT DISTINCT json_each.value as genre
                         FROM media_items m
                         JOIN user_feedback f ON m.id = f.media_id
                         CROSS JOIN json_each(m.genres)
                     )
-                    SELECT id 
-                    FROM media_items m
-                    WHERE type = ?
-                    AND id NOT IN (SELECT media_id FROM user_feedback)
+                    {base_query}
                     AND EXISTS (
                         SELECT 1 
-                        FROM json_each(m.genres) 
+                        FROM json_each(genres) 
                         WHERE json_each.value NOT IN (SELECT genre FROM FeedbackGenres)
                     )
                     ORDER BY RANDOM()
                     LIMIT 100
                 ''', (media_type,))
             else:
-                cursor.execute('''
-                    SELECT id 
-                    FROM media_items 
-                    WHERE type = ?
-                    AND id NOT IN (SELECT media_id FROM user_feedback)
+                cursor.execute(f'''
+                    {base_query}
                     ORDER BY 
-                        COALESCE(vote_average * vote_count + popularity, 0) DESC,
+                        COALESCE(vote_average * LOG10(vote_count + 1) + popularity, 0) DESC,
                         RANDOM()
                     LIMIT 100
                 ''', (media_type,))
@@ -2459,7 +2653,7 @@ class RecommendationEngine:
             self.logger.error(f"Error getting candidates: {str(e)}")
             print(f"Database error in _get_candidates: {str(e)}")
             return []
-                                    
+
     def _get_content_based_scores(self, candidates):
         scores = {}
         cursor = self.db.conn.cursor()
@@ -2557,7 +2751,7 @@ class RecommendationEngine:
             print(f"\nGetting recommendation for media_type: {media_type}")
             
             candidates = self._get_candidates(media_type)
-            print(f"Found {len(candidates)} candidates")
+            print(f"Initial candidates: {len(candidates)}")
             
             if not candidates:
                 print("No candidates found!")
@@ -2566,16 +2760,37 @@ class RecommendationEngine:
             cursor = self.db.conn.cursor()
             best_item = None
             best_score = float('-inf')
+            current_id = None
+
+            try:
+                cursor.execute('''
+                    SELECT id FROM media_items 
+                    WHERE type = ? 
+                    ORDER BY last_recommended DESC 
+                    LIMIT 1
+                ''', (media_type,))
+                result = cursor.fetchone()
+                if result:
+                    current_id = result[0]
+            except Exception as e:
+                print(f"Error getting current item: {e}")
 
             for item_id in candidates:
+                if item_id == current_id:
+                    continue
+
                 try:
                     cursor.execute('''
                         SELECT * FROM media_items 
                         WHERE id = ? AND type = ?
+                        AND is_blocked = 0
+                        AND id NOT IN (
+                            SELECT media_id FROM user_feedback
+                        )
                     ''', (item_id, media_type))
                     
                     columns = [description[0] for description in cursor.description]
-                    item_data = dict(zip(columns, cursor.fetchone()))
+                    item_data = dict(zip(columns, cursor.fetchone() or []))
                     
                     if not item_data:
                         continue
@@ -2592,6 +2807,16 @@ class RecommendationEngine:
                     continue
 
             if best_item:
+                try:
+                    cursor.execute('''
+                        UPDATE media_items 
+                        SET last_recommended = CURRENT_TIMESTAMP 
+                        WHERE id = ?
+                    ''', (best_item['id'],))
+                    self.db.conn.commit()
+                except Exception as e:
+                    print(f"Error updating last_recommended: {e}")
+                    
                 print(f"Selected item: {best_item.get('title')} (ID: {best_item.get('id')})")
                 return best_item
 
@@ -2602,7 +2827,7 @@ class RecommendationEngine:
             self.logger.error(f"Error getting recommendation: {str(e)}")
             print(f"Error in get_next_recommendation: {str(e)}")
             return None
-        
+
     def _calculate_item_score(self, item_data: Dict) -> float:
         try:
             popularity = float(item_data.get('popularity', 0))
@@ -3270,24 +3495,8 @@ class RecommendationEngine:
         
         return encoded_metadata
 
-    def _process_json_field(self, field: Union[str, List, Dict, None]) -> str:
-        try:
-            if field is None:
-                return ""
-            if isinstance(field, (list, dict)):
-                return json.dumps(field)  
-            if isinstance(field, str):
-                try:
-                    parsed = json.loads(field)
-                    if isinstance(parsed, (list, dict)):
-                        return json.dumps(parsed)
-                    return str(parsed)
-                except json.JSONDecodeError:
-                    return field
-            return str(field)
-        except Exception as e:
-            self.logger.error(f"Error processing field: {field}, {str(e)}")
-            return ""
+    def _process_json_field(self, field):
+        return self.json_utils.process_json_field(field)
 
 
     def _one_hot_genres(self, genres_str: Union[str, List]) -> torch.Tensor:
@@ -4019,6 +4228,8 @@ class BackgroundTrainer(QThread):
         self._embedding_lock = threading.Lock()
         self._training_queue = deque(maxlen=1000)
         self._queue_lock = threading.Lock()
+        self.logger = logging.getLogger(__name__)
+        self.json_utils = JSONUtils()
             
     def run(self):
         while not self._stop_flag.is_set():
@@ -4261,14 +4472,33 @@ class BackgroundTrainer(QThread):
                     self.logger.error(f"Error training batch: {str(e)}")
                     continue
 
+    def _process_json_field(self, field):
+        return self.json_utils.process_json_field(field)
+
     def _update_item_preferences(self, item_data):
         if not isinstance(item_data, dict):
             return
-            
+                
         try:
-            genres = self._process_json_field(item_data.get('genres', '[]'))
+            genres = self.json_utils.process_json_field(item_data.get('genres', '[]'))
             if genres:
-                self._update_genre_preferences(genres, item_data.get('vote_average', 5.0))
+                genres_list = self.json_utils.extract_list(genres)
+                if genres_list:
+                    with self.preference_lock:
+                        cursor = self.db.conn.cursor()
+                        for genre_name in genres_list:
+                            if genre_name:
+                                cursor.execute('''
+                                    INSERT INTO genre_preferences (genre, rating_sum, rating_count)
+                                    VALUES (?, ?, 1)
+                                    ON CONFLICT(genre) DO UPDATE SET
+                                        rating_sum = rating_sum + ?,
+                                        rating_count = rating_count + 1
+                                ''', (genre_name, 
+                                     float(item_data.get('vote_average', 5.0)), 
+                                     float(item_data.get('vote_average', 5.0))))
+                        self.db.conn.commit()
+                    
         except Exception as e:
             self.logger.error(f"Error updating preferences: {str(e)}")
 
