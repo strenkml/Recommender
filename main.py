@@ -1330,7 +1330,8 @@ class MediaRecommenderApp(QMainWindow):
         }
         
         return tab_widget
-                
+
+
     def init_config_tab(self):
         config_widget = QWidget()
         layout = QVBoxLayout()
@@ -1348,19 +1349,40 @@ class MediaRecommenderApp(QMainWindow):
 
         plex_group = QGroupBox("Plex Configuration")
         plex_layout = QFormLayout()
+        
         self.plex_url = QLineEdit()
-        self.plex_token = QLineEdit()
         plex_layout.addRow("Plex URL:", self.plex_url)
-        plex_layout.addRow("Plex Token:", self.plex_token)
+        
+        plex_token_layout = QHBoxLayout()
+        self.plex_token = QLineEdit()
+        plex_token_layout.addWidget(self.plex_token)
+        plex_help = QLabel('<a style="color: #42A5F5; font-weight: bold; text-decoration: underline;" href="https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/">[ Get Token ]</a>')
+        plex_help.setOpenExternalLinks(True)
+        plex_token_layout.addWidget(plex_help)
+        plex_layout.addRow("Plex Token:", plex_token_layout)
+        
         plex_group.setLayout(plex_layout)
         layout.addWidget(plex_group)
 
         api_group = QGroupBox("API Configuration")
         api_layout = QFormLayout()
+        
+        tvdb_layout = QHBoxLayout()
         self.tvdb_key = QLineEdit()
+        tvdb_layout.addWidget(self.tvdb_key)
+        tvdb_help = QLabel('<a style="color: #42A5F5; font-weight: bold; text-decoration: underline;" href="https://thetvdb.com/api-information">[ Get API Key ]</a>')
+        tvdb_help.setOpenExternalLinks(True)
+        tvdb_layout.addWidget(tvdb_help)
+        api_layout.addRow("TVDB API Key:", tvdb_layout)
+        
+        tmdb_layout = QHBoxLayout()
         self.tmdb_key = QLineEdit()
-        api_layout.addRow("TVDB API Key:", self.tvdb_key)
-        api_layout.addRow("TMDB API Key:", self.tmdb_key)
+        tmdb_layout.addWidget(self.tmdb_key)
+        tmdb_help = QLabel('<a style="color: #42A5F5; font-weight: bold; text-decoration: underline;" href="https://developer.themoviedb.org/docs/getting-started">[ Get API Key ]</a>')
+        tmdb_help.setOpenExternalLinks(True)
+        tmdb_layout.addWidget(tmdb_help)
+        api_layout.addRow("TMDB API Key:", tmdb_layout)
+        
         api_group.setLayout(api_layout)
         layout.addWidget(api_group)
 
@@ -1388,7 +1410,7 @@ class MediaRecommenderApp(QMainWindow):
         scan_button = QPushButton("Scan Libraries")
         scan_button.clicked.connect(self.scan_libraries)
         model_layout.addWidget(scan_button)
-       
+        
         model_group.setLayout(model_layout)
         layout.addWidget(model_group)
 
@@ -1397,8 +1419,8 @@ class MediaRecommenderApp(QMainWindow):
         layout.addWidget(self.progress_text)
 
         config_widget.setLayout(layout)
-        self.tabs.addTab(config_widget, "Configuration")
-                                   
+        self.tabs.addTab(config_widget, "Configuration")                   
+
     def show_rating_dialog(self, rating_type, media_type):
         dialog = QDialog(self)
         dialog.setWindowTitle(f"Rate how much you {'liked' if rating_type == 'like' else 'disliked'} it")
