@@ -1317,13 +1317,21 @@ class MediaRecommenderApp(QMainWindow):
         watchlist_button = QPushButton("Add to Plex Watchlist")
         watchlist_button.clicked.connect(lambda: self.add_to_watchlist(media_type))
         watchlist_button.setFixedWidth(150)
+        collection_button = QPushButton("Add to Collection")
+        collection_button.clicked.connect(lambda: self.add_to_collection(media_type))
+        collection_button.setFixedWidth(150)
+        collection_button.setVisible(media_type == 'movie')
+        
         
         button_layout.addStretch()
         button_layout.addWidget(skip_button)
         button_layout.addWidget(never_button)
         button_layout.addWidget(watchlist_button)
+        button_layout.addWidget(collection_button)
         button_layout.addStretch()
         layout.addLayout(button_layout)
+  
+
         
         tab_widget.setLayout(layout)
         
@@ -1503,6 +1511,110 @@ class MediaRecommenderApp(QMainWindow):
         self.progress_text.append(success_msg)
         QMessageBox.information(self, "Success", success_msg)
 
+    def add_to_collection(self, media_type):
+        if media_type != 'movie':
+            return
+        
+        try:
+            current_id = self.media_widgets[media_type]['current_item_id']
+            if current_id is None:
+                return
+
+            cursor = self.db.conn.cursor()
+            cursor.execute('SELECT * FROM media_items WHERE id = ?', (current_id,))
+            columns = [description[0] for description in cursor.description]
+            item = dict(zip(columns, cursor.fetchone()))
+            
+            if not item:
+                return
+                
+            collection_name = self.collection_name.text().strip()
+            if not collection_name:
+                QMessageBox.warning(
+                    self,
+                    "Invalid Collection Name",
+                    "Please enter a valid collection name in the configuration."
+                )
+                return
+                
+            plex = PlexServer(self.plex_url.text(), self.plex_token.text())
+            
+            search_results = plex.library.search(
+                title=item['title'],
+                year=item['year'],
+                libtype=media_type
+            )
+            
+            if not search_results:
+                QMessageBox.warning(
+                    self,
+                    "Not Found",
+                    f"Could not find {item['title']} in your Plex library.\n\n"
+                    f"Note: The item must exist in your Plex library to be added to a collection."
+                )
+                return
+
+            exact_matches = []
+            for result in search_results:
+                if result.title.lower() != item['title'].lower():
+                    continue
+                    
+                if item['year'] and hasattr(result, 'year'):
+                    if int(item['year']) != result.year:
+                        continue
+                        
+                if media_type == 'movie' and item.get('tmdb_id'):
+                    if hasattr(result, 'guids'):
+                        tmdb_match = False
+                        for guid in result.guids:
+                            if str(item['tmdb_id']) in str(guid.id):
+                                tmdb_match = True
+                                break
+                        if not tmdb_match:
+                            continue
+                            
+                exact_matches.append(result)
+
+            if not exact_matches:
+                reply = QMessageBox.question(
+                    self,
+                    "No Exact Match",
+                    f"No exact match found for {item['title']}.\n"
+                    f"Would you like to see all potential matches?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No
+                )
+                
+                if reply == QMessageBox.Yes:
+                    selected_item = self._show_match_selection_dialog(search_results, item['title'])
+                    if selected_item:
+                        exact_matches = [selected_item]
+                return
+                
+            elif len(exact_matches) > 1:
+                selected_item = self._show_match_selection_dialog(exact_matches, item['title'])
+                if not selected_item:
+                    return
+                exact_matches = [selected_item]
+
+            if exact_matches:
+                movie = exact_matches[0]
+                movie.addCollection(collection_name)
+                
+                QMessageBox.information(
+                    self,
+                    "Success",
+                    f"Added {movie.title} to collection '{collection_name}'!"
+                )
+                
+        except Exception as e:
+            self.logger.error(f"Error adding to collection: {str(e)}")
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"Failed to add to collection: {str(e)}"
+            )
+
     def _show_match_selection_dialog(self, matches, title):
         dialog = QDialog(self)
         dialog.setWindowTitle(f"Select Match for {title}")
@@ -1568,6 +1680,9 @@ class MediaRecommenderApp(QMainWindow):
         plex_token_layout.addWidget(plex_help)
         plex_layout.addRow("Plex Token:", plex_token_layout)
         
+        self.collection_name = QLineEdit("AI Recommended")
+        plex_layout.addRow("Collection To Add Movies To:", self.collection_name)
+
         plex_group.setLayout(plex_layout)
         layout.addWidget(plex_group)
 
@@ -2084,7 +2199,8 @@ class MediaRecommenderApp(QMainWindow):
             'plex_url': self.plex_url.text().strip(),
             'plex_token': self.plex_token.text().strip(),
             'tvdb_key': self.tvdb_key.text().strip(),
-            'tmdb_key': self.tmdb_key.text().strip()
+            'tmdb_key': self.tmdb_key.text().strip(),
+            'collection_name': self.collection_name.text().strip()
         }
 
         try:
