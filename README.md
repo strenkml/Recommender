@@ -157,6 +157,9 @@ When the app first opens, you’ll see three main tabs:
 - Display the recommended poster (if available).
 - Show the title, year, runtime, genres, and a short summary.
 - You can provide a rating from 1 to 10 using the rating buttons.
+- "Skip" button to move to the next recommendation.
+- "Block Item" button to never show this item again.
+- "Add to Plex Watchlist" button to add the item to your Plex watchlist.
 
 ### Rating Items
 
@@ -171,6 +174,20 @@ A separate **Background Trainer** thread is initialized at startup. It:
 - Rebuilds the similarity matrix.
 - Uses user feedback to train the model weights incrementally.
 - Logs its progress in the bottom text box of the **Configuration** tab.
+
+### Watchlist Management
+
+- **Adding to Watchlist**: Each movie/show recommendation has an "Add to Plex Watchlist" button. When clicked, it will:
+  - Search for the exact match in your Plex library
+  - If found, add it to your watchlist
+  - If multiple matches are found, allow you to select the correct one
+  - Show a confirmation when added successfully
+
+- **Clearing Watchlist**: In the Configuration tab:
+  - Click "Clear Plex Watchlist" to remove all items
+  - Confirms before proceeding
+  - Shows real-time progress in the Configuration tab's text area
+  - Provides a summary when complete
 
 ---
 
