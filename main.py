@@ -1309,12 +1309,19 @@ class MediaRecommenderApp(QMainWindow):
         skip_button = QPushButton("Skip")
         skip_button.clicked.connect(lambda: self.skip_item(media_type))
         skip_button.setFixedWidth(100)
+        
         never_button = QPushButton("Block Item")
         never_button.clicked.connect(lambda: self.never_show_item(media_type))
         never_button.setFixedWidth(100)
+        
+        watchlist_button = QPushButton("Add to Plex Watchlist")
+        watchlist_button.clicked.connect(lambda: self.add_to_watchlist(media_type))
+        watchlist_button.setFixedWidth(150)
+        
         button_layout.addStretch()
         button_layout.addWidget(skip_button)
         button_layout.addWidget(never_button)
+        button_layout.addWidget(watchlist_button)
         button_layout.addStretch()
         layout.addLayout(button_layout)
         
@@ -1326,10 +1333,210 @@ class MediaRecommenderApp(QMainWindow):
             'year_runtime_label': year_runtime_label,
             'genres_label': genres_label,
             'summary_text': summary_text,
-            'current_item_id': None
+            'current_item_id': None,
+            'watchlist_button': watchlist_button  
         }
         
         return tab_widget
+
+    def add_to_watchlist(self, media_type):
+        try:
+            current_id = self.media_widgets[media_type]['current_item_id']
+            if current_id is None:
+                return
+
+            cursor = self.db.conn.cursor()
+            cursor.execute('SELECT * FROM media_items WHERE id = ?', (current_id,))
+            columns = [description[0] for description in cursor.description]
+            item = dict(zip(columns, cursor.fetchone()))
+            
+            if not item:
+                return
+                
+            plex = PlexServer(self.plex_url.text(), self.plex_token.text())
+            
+            search_results = plex.library.search(
+                title=item['title'],
+                year=item['year'],
+                libtype=media_type
+            )
+            
+            if not search_results:
+                QMessageBox.warning(
+                    self, 
+                    "Not Found", 
+                    f"Could not find {item['title']} in your Plex library.\n\n"
+                    f"Note: The item must exist in your Plex library to be added to the watchlist."
+                )
+                return
+
+            exact_matches = []
+            for result in search_results:
+                if result.title.lower() != item['title'].lower():
+                    continue
+                    
+                if item['year'] and hasattr(result, 'year'):
+                    if int(item['year']) != result.year:
+                        continue
+                        
+                if media_type == 'show' and item.get('tvdb_id'):
+                    if hasattr(result, 'guids'):
+                        tvdb_match = False
+                        for guid in result.guids:
+                            if str(item['tvdb_id']) in str(guid.id):
+                                tvdb_match = True
+                                break
+                        if not tvdb_match:
+                            continue
+                            
+                if media_type == 'movie' and item.get('tmdb_id'):
+                    if hasattr(result, 'guids'):
+                        tmdb_match = False
+                        for guid in result.guids:
+                            if str(item['tmdb_id']) in str(guid.id):
+                                tmdb_match = True
+                                break
+                        if not tmdb_match:
+                            continue
+                            
+                exact_matches.append(result)
+
+            if not exact_matches:
+                reply = QMessageBox.question(
+                    self,
+                    "No Exact Match",
+                    f"No exact match found for {item['title']}.\n"
+                    f"Would you like to see all potential matches?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No
+                )
+                
+                if reply == QMessageBox.Yes:
+                    self._show_match_selection_dialog(search_results, item['title'])
+                return
+                
+            elif len(exact_matches) == 1:
+                selected_item = exact_matches[0]
+            else:
+                selected_item = self._show_match_selection_dialog(exact_matches, item['title'])
+                if not selected_item:
+                    return
+
+            account = plex.myPlexAccount()
+            account.addToWatchlist(selected_item)
+            
+            QMessageBox.information(
+                self, 
+                "Success", 
+                f"Added {selected_item.title} to your Plex watchlist!"
+            )
+                
+        except Exception as e:
+            self.logger.error(f"Error adding to watchlist: {str(e)}")
+            QMessageBox.critical(
+                self, 
+                "Error", 
+                f"Failed to add to watchlist: {str(e)}"
+            )
+
+    def clear_plex_watchlist(self):
+        try:
+            reply = QMessageBox.question(
+                self,
+                "Clear Watchlist",
+                "Are you sure you want to clear your entire Plex watchlist?\n\nThis action cannot be undone.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            
+            if reply == QMessageBox.No:
+                return
+
+            self.progress_text.clear()
+            self.progress_text.append("Starting watchlist clear...")
+            
+            self.watchlist_worker = WatchlistClearWorker(
+                self.plex_url.text(),
+                self.plex_token.text()
+            )
+            
+            self.watchlist_worker.progress.connect(
+                lambda msg: self.progress_text.append(msg)
+            )
+            
+            self.watchlist_worker.error.connect(
+                lambda err: self.handle_watchlist_error(err)
+            )
+            
+            self.watchlist_worker.finished.connect(
+                lambda count: self.handle_watchlist_cleared(count)
+            )
+            
+            for widget in self.findChildren(QPushButton):
+                if widget.text() == "Clear Plex Watchlist":
+                    widget.setEnabled(False)
+                    self.watchlist_worker.finished.connect(
+                        lambda: widget.setEnabled(True)
+                    )
+                    self.watchlist_worker.error.connect(
+                        lambda: widget.setEnabled(True)
+                    )
+                    break
+                    
+            self.watchlist_worker.start()
+                
+        except Exception as e:
+            self.logger.error(f"Error starting watchlist clear: {str(e)}")
+            self.progress_text.append(f"Error: {str(e)}")
+
+    def handle_watchlist_error(self, error_msg):
+        self.logger.error(f"Watchlist clear error: {error_msg}")
+        self.progress_text.append(f"Error: {error_msg}")
+        QMessageBox.critical(
+            self, 
+            "Error", 
+            f"Failed to clear watchlist: {error_msg}"
+        )
+
+    def handle_watchlist_cleared(self, count):
+        success_msg = f"Successfully cleared {count} items from your Plex watchlist!"
+        self.progress_text.append(success_msg)
+        QMessageBox.information(self, "Success", success_msg)
+
+    def _show_match_selection_dialog(self, matches, title):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Select Match for {title}")
+        layout = QVBoxLayout()
+        
+        label = QLabel("Please select the correct match:")
+        layout.addWidget(label)
+        
+        list_widget = QListWidget()
+        for match in matches:
+            item_text = f"{match.title}"
+            if hasattr(match, 'year'):
+                item_text += f" ({match.year})"
+            if hasattr(match, 'summary'):
+                item_text += f"\nSummary: {match.summary[:100]}..."
+                
+            item = QListWidgetItem(item_text)
+            item.setData(Qt.UserRole, match)
+            list_widget.addItem(item)
+            
+        layout.addWidget(list_widget)
+        
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        
+        dialog.setLayout(layout)
+        
+        if dialog.exec_() == QDialog.Accepted and list_widget.currentItem():
+            return list_widget.currentItem().data(Qt.UserRole)
+        return None
 
 
     def init_config_tab(self):
@@ -1411,6 +1618,11 @@ class MediaRecommenderApp(QMainWindow):
         scan_button.clicked.connect(self.scan_libraries)
         model_layout.addWidget(scan_button)
         
+        clear_watchlist_button = QPushButton("Clear Plex Watchlist")
+        clear_watchlist_button.setToolTip("Remove all items from your Plex watchlist")
+        clear_watchlist_button.clicked.connect(self.clear_plex_watchlist)
+        model_layout.addWidget(clear_watchlist_button)
+
         model_group.setLayout(model_layout)
         layout.addWidget(model_group)
 
@@ -2172,6 +2384,50 @@ class SimilarityWorker(QObject):
 
     def stop(self):
         self._stop = True
+
+class WatchlistClearWorker(QThread):
+    progress = Signal(str)
+    finished = Signal(int)
+    error = Signal(str)
+
+    def __init__(self, plex_url, plex_token):
+        super().__init__()
+        self.plex_url = plex_url
+        self.plex_token = plex_token
+        self._stop_flag = False
+
+    def run(self):
+        try:
+            plex = PlexServer(self.plex_url, self.plex_token)
+            account = plex.myPlexAccount()
+            watchlist = account.watchlist()
+            
+            total_items = len(watchlist)
+            if total_items == 0:
+                self.progress.emit("No items found in watchlist")
+                self.finished.emit(0)
+                return
+
+            self.progress.emit(f"Found {total_items} items in watchlist")
+            cleared_count = 0
+
+            for item in watchlist:
+                if self._stop_flag:
+                    break
+                try:
+                    item.removeFromWatchlist()
+                    cleared_count += 1
+                    self.progress.emit(f"Cleared {cleared_count}/{total_items} items...")
+                except Exception as e:
+                    self.progress.emit(f"Error clearing item: {str(e)}")
+
+            self.finished.emit(cleared_count)
+
+        except Exception as e:
+            self.error.emit(str(e))
+
+    def stop(self):
+        self._stop_flag = True
 
 class JSONUtils:
     @staticmethod
