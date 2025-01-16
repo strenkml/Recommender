@@ -31,6 +31,7 @@ The instructions are below. You can either run main.py directory or run the comp
   - [Movies and TV Tabs](#movies-and-tv-tabs)
   - [Rating Items](#rating-items)
   - [Background Training](#background-training)
+  - [Watchlist Management](#watchlist-management)
 - [How It Works](#how-it-works)
   - [Database Schema](#database-schema)
   - [Embedding Computations](#embedding-computations)
