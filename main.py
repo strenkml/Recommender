@@ -1296,9 +1296,7 @@ class MediaRecommenderApp(QMainWindow):
             rating = i + 1
             button = QPushButton(str(rating))
             button.setFixedWidth(40)
-            def make_callback(r):
-                return lambda checked: self.submit_rating(r, media_type)
-            button.clicked.connect(make_callback(rating))
+            button.clicked.connect(lambda checked, r=rating: self.submit_rating(r, media_type))
             rating_container.addWidget(button)
             rating_buttons.addButton(button)
         
@@ -1317,11 +1315,11 @@ class MediaRecommenderApp(QMainWindow):
         watchlist_button = QPushButton("Add to Plex Watchlist")
         watchlist_button.clicked.connect(lambda: self.add_to_watchlist(media_type))
         watchlist_button.setFixedWidth(150)
+        
         collection_button = QPushButton("Add to Collection")
         collection_button.clicked.connect(lambda: self.add_to_collection(media_type))
         collection_button.setFixedWidth(150)
         collection_button.setVisible(media_type == 'movie')
-        
         
         button_layout.addStretch()
         button_layout.addWidget(skip_button)
@@ -1330,8 +1328,6 @@ class MediaRecommenderApp(QMainWindow):
         button_layout.addWidget(collection_button)
         button_layout.addStretch()
         layout.addLayout(button_layout)
-  
-
         
         tab_widget.setLayout(layout)
         
@@ -1342,7 +1338,7 @@ class MediaRecommenderApp(QMainWindow):
             'genres_label': genres_label,
             'summary_text': summary_text,
             'current_item_id': None,
-            'watchlist_button': watchlist_button  
+            'watchlist_button': watchlist_button
         }
         
         return tab_widget
@@ -2640,7 +2636,7 @@ class RecommendationEngine:
             {'params': self.temporal_encoder.parameters()},
             {'params': self.metadata_encoder.parameters()},
             {'params': self.graph_conv.parameters()}
-        ], lr=1e-4)
+        ], lr=1e-4, weight_decay=0.01)
         
         self.criterion = nn.MSELoss()
         
@@ -3980,10 +3976,6 @@ class RecommendationEngine:
                 except Exception as e:
                     print(f"Error processing similar items: {e}")
                 
-        except Exception as e:
-            self.logger.error(f"Error updating knowledge graph: {str(e)}")
-            print(f"Error in knowledge graph update: {e}")
-            print(f"Traceback: {traceback.format_exc()}")            
         except Exception as e:
             self.logger.error(f"Error updating knowledge graph: {str(e)}")
             print(f"Error in knowledge graph update: {e}")
