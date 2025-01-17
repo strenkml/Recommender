@@ -1105,7 +1105,9 @@ class MediaRecommenderApp(QMainWindow):
         super().__init__()
         self.setWindowTitle("Recommend For Plex")
         self.setMinimumSize(1200, 800)
-    
+        
+        self.db = Database.get_instance()
+        
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logging.INFO)
         temp_dir = tempfile.gettempdir()
@@ -1114,22 +1116,21 @@ class MediaRecommenderApp(QMainWindow):
         log_handler = RotatingFileHandler(log_file_path, maxBytes=10*1024*1024, backupCount=5)
         log_handler.setFormatter(log_formatter)
         self.logger.addHandler(log_handler)
-    
+        
+        self.blocked_items = set()
+        self._load_blocked_items()
+        
         self.media_widgets = {}
         self.background_trainer = None
         self.skipped_items = {'movie': set(), 'show': set()}
-        self.blocked_items = set()
-        self._load_blocked_items()
-    
+        
         self.init_ui()
-    
         self.load_config()
-    
-        self.db = None
+        
         self.recommender = None
         self.media_scanner = None
         self.poster_downloader = PosterDownloader()
-    
+        
         QTimer.singleShot(0, self.init_background_components)
 
     def init_background_components(self):
@@ -1839,10 +1840,15 @@ class MediaRecommenderApp(QMainWindow):
                 
     def _load_blocked_items(self):
         try:
-            cursor = self.db.conn.cursor()
-            cursor.execute('SELECT id FROM media_items WHERE is_blocked = 1')
-            blocked = cursor.fetchall()
-            self.blocked_items = {row[0] for row in blocked}
+            if self.db and self.db.conn:
+                cursor = self.db.conn.cursor()
+                cursor.execute('SELECT id FROM media_items WHERE is_blocked = 1')
+                blocked = cursor.fetchall()
+                self.blocked_items = {row[0] for row in blocked}
+                self.logger.info(f"Loaded {len(self.blocked_items)} blocked items")
+            else:
+                self.logger.warning("Database not initialized when loading blocked items")
+                self.blocked_items = set()
         except Exception as e:
             self.logger.error(f"Error loading blocked items: {str(e)}")
             self.blocked_items = set()
