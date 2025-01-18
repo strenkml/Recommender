@@ -15,6 +15,7 @@ The instructions are below. You can either run main.py directory or run the comp
 
 
 ## Please consider this a evolving WIP. I'll do my best to ensure it is stable before any publishing but report any issues you encounter.
+## Note: There is a known bug where the application will freeze if it doing embedding computation, you have a large library, and it tries to compute the similarity matrix. The workaround is to scan in the large library and leave the app up without interacting with it, for 2 hours. This will give it time to churn through all the computations it needs to. I'm working on a new version with a LOT of performance and stability fixes, but it could be a few days.
 
 
 ## Table of Contents
