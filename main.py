@@ -19,15 +19,24 @@ from datetime import datetime
 from typing import Optional, Dict, Any, Tuple, List, Union, Set
 from collections import defaultdict, deque
 from logging.handlers import RotatingFileHandler
+from plexapi.server import PlexServer
+from aiohttp import ClientTimeout, ClientSession, TCPConnector, ClientError
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import GCNConv, GATConv, GraphSAGE
+import nltk
+from sentence_transformers import SentenceTransformer
+import shiboken6
+
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
     QTextEdit, QPushButton, QGroupBox, QFormLayout, QLineEdit, QListWidget, 
     QListWidgetItem, QMessageBox, QAbstractItemView, QDialog, QRadioButton, 
-    QDialogButtonBox, QButtonGroup
+    QDialogButtonBox, QButtonGroup, QToolButton
 )
 from PySide6.QtCore import (
-    Qt, QTimer, QThread, Signal, QUrl, QObject, QEventLoop, QSize
+    Qt, QTimer, QThread, Signal, QUrl, QObject, QEventLoop, QSize, QMutex
 )
 from PySide6.QtGui import (
     QPalette, QColor, QPixmap, QPainter, QFont, QIcon, QCloseEvent
@@ -36,13 +45,7 @@ from PySide6.QtNetwork import (
     QNetworkAccessManager, QNetworkRequest, QNetworkReply
 )
 
-from plexapi.server import PlexServer
-from aiohttp import ClientTimeout, ClientSession, TCPConnector, ClientError
-import torch.nn as nn
-import torch.nn.functional as F
-from torch_geometric.nn import GCNConv, GATConv, GraphSAGE
-import nltk
-from transformers import AutoModel, AutoTokenizer
+
 
 class Database:
     _instance = None
@@ -76,11 +79,12 @@ class Database:
             pragmas = [
                 'PRAGMA journal_mode = WAL',
                 'PRAGMA synchronous = NORMAL',
-                'PRAGMA cache_size = -2000000',
-                'PRAGMA mmap_size = 30000000000',
+                'PRAGMA cache_size = -4000000',
+                'PRAGMA mmap_size = 60000000000',
                 'PRAGMA temp_store = MEMORY',
                 'PRAGMA page_size = 4096',
-                'PRAGMA foreign_keys = ON'
+                'PRAGMA foreign_keys = ON',
+                'PRAGMA read_uncommitted = 1'
             ]
             for pragma in pragmas:
                 cursor.execute(pragma)
@@ -222,7 +226,12 @@ class Database:
                 'CREATE INDEX IF NOT EXISTS idx_media_embedding_join ON media_items (id)',
                 'CREATE INDEX IF NOT EXISTS idx_feedback_media_join ON user_feedback (media_id)',
                 'CREATE INDEX IF NOT EXISTS idx_sim_item1 ON similarity_matrix (item1_id)',
-                'CREATE INDEX IF NOT EXISTS idx_sim_item2 ON similarity_matrix (item2_id)'
+                'CREATE INDEX IF NOT EXISTS idx_sim_item2 ON similarity_matrix (item2_id)',
+                'CREATE INDEX IF NOT EXISTS idx_feedback_quick ON user_feedback (media_id, rating)',
+                'CREATE INDEX IF NOT EXISTS idx_media_quick ON media_items (type, year, popularity, vote_average)',
+                'CREATE INDEX IF NOT EXISTS idx_genres_quick ON media_items (genres)',
+                'CREATE INDEX IF NOT EXISTS idx_recommendations_combined ON media_items (type, is_blocked, last_recommended)',
+                'CREATE INDEX IF NOT EXISTS idx_embedding_lookup ON embedding_cache (media_id, last_updated)'
             ]
             for index in indices:
                 cursor.execute(index)
@@ -358,26 +367,6 @@ class Database:
             raise
         finally:
             cursor.close()
-
-    def get_database_stats(self):
-        with self.get_cursor() as cursor:
-            stats = {}
-            tables = ['media_items', 'user_feedback', 'embedding_cache', 'similarity_matrix', 'genre_preferences']
-            
-            for table in tables:
-                cursor.execute(f"SELECT COUNT(*) FROM {table}")
-                stats[f"{table}_count"] = cursor.fetchone()[0]
-
-            cursor.execute("PRAGMA page_count")
-            page_count = cursor.fetchone()[0]
-            cursor.execute("PRAGMA page_size")
-            page_size = cursor.fetchone()[0]
-            stats['database_size_mb'] = (page_count * page_size) / (1024 * 1024)
-
-            cursor.execute("SELECT name, sql FROM sqlite_master WHERE type='index'")
-            stats['indices'] = cursor.fetchall()
-
-            return stats
 
     def close(self):
         if not self.write_lock.acquire(timeout=5):
@@ -682,24 +671,6 @@ class TMDBClient:
                 await asyncio.sleep(2 ** attempt)
                
         raise RuntimeError("Max retries exceeded")
-
-    async def create_request_token(self, redirect_to: Optional[str] = None) -> Dict:
-        data = {"redirect_to": redirect_to} if redirect_to else {}
-        return await self._make_request('POST', '/auth/request_token', json=data)
-
-    async def create_access_token(self, request_token: str) -> Dict:
-        return await self._make_request(
-            'POST', 
-            '/auth/access_token',
-            json={"request_token": request_token}
-        )
-
-    async def delete_access_token(self, access_token: str) -> Dict:
-        return await self._make_request(
-            'DELETE',
-            '/auth/access_token',
-            json={"access_token": access_token}
-        )
 
     async def get_list(self, list_id: int, language: str = "en-US", page: int = 1) -> Dict:
         params = {
@@ -1089,9 +1060,6 @@ class CleanupWorker(QObject):
                         pass
                 self.app.media_scanner = None
 
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
             if hasattr(self.app, 'poster_downloader'):
                 self.app.poster_downloader.cleanup()
 
@@ -1116,7 +1084,8 @@ class MediaRecommenderApp(QMainWindow):
         log_handler = RotatingFileHandler(log_file_path, maxBytes=10*1024*1024, backupCount=5)
         log_handler.setFormatter(log_formatter)
         self.logger.addHandler(log_handler)
-        
+        self.item_history = {'movie': deque(maxlen=2), 'show': deque(maxlen=2)}
+        self.current_items = {'movie': None, 'show': None}
         self.blocked_items = set()
         self._load_blocked_items()
         
@@ -1249,6 +1218,59 @@ class MediaRecommenderApp(QMainWindow):
     def init_tv_tab(self):
         self.tv_tab = self.create_media_tab("show")
         self.tabs.addTab(self.tv_tab, "TV Shows")
+
+    def create_rating_button(self, rating: int) -> QToolButton:
+        button = QToolButton()
+        button.setFixedSize(40, 40)
+        
+        
+        layout = QVBoxLayout(button)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        
+        
+        star_label = QLabel("★")
+        star_label.setAlignment(Qt.AlignCenter)
+        star_label.setStyleSheet("""
+            QLabel {
+                color: #FFD700; 
+                font-size: 24px;
+                font-weight: bold;
+            }
+        """)
+        
+        
+        number_label = QLabel(str(rating))
+        number_label.setAlignment(Qt.AlignCenter)
+        number_label.setStyleSheet("""
+            QLabel {
+                color: black;
+                font-size: 12px;
+                font-weight: bold;
+                background: transparent;
+            }
+        """)
+        
+        
+        layout.addWidget(star_label)
+        layout.addWidget(number_label)
+        
+        
+        button.setStyleSheet("""
+            QToolButton {
+                border: none;
+                background: transparent;
+            }
+            QToolButton:hover {
+                background-color: rgba(255, 215, 0, 0.2);  /* Light gold hover effect */
+                border-radius: 5px;
+            }
+            QToolButton:pressed {
+                background-color: rgba(255, 215, 0, 0.4);
+            }
+        """)
+        
+        return button
        
     def create_media_tab(self, media_type):
         tab_widget = QWidget()
@@ -1289,14 +1311,22 @@ class MediaRecommenderApp(QMainWindow):
         rating_container = QHBoxLayout()
         rating_container.addStretch(1)
         
-        rating_label = QLabel("Rate (1-10):")
+        rating_container = QHBoxLayout()
+        rating_container.addStretch(1)
+
+        back_button = QPushButton("Back")
+        back_button.setFixedWidth(100)
+        back_button.clicked.connect(lambda: self.show_previous_item(media_type))
+        rating_container.addWidget(back_button)
+            
+        rating_label = QLabel("Rate:")
+        rating_label.setStyleSheet("font-size: 14px; font-weight: bold;")
         rating_container.addWidget(rating_label)
         
         rating_buttons = QButtonGroup()
         for i in range(10):
             rating = i + 1
-            button = QPushButton(str(rating))
-            button.setFixedWidth(40)
+            button = self.create_rating_button(rating)
             button.clicked.connect(lambda checked, r=rating: self.submit_rating(r, media_type))
             rating_container.addWidget(button)
             rating_buttons.addButton(button)
@@ -1776,29 +1806,42 @@ class MediaRecommenderApp(QMainWindow):
                 self.submit_rating(rating_type, stars, media_type)
                
     def submit_rating(self, rating: int, media_type: str):
-        current_id = self.media_widgets[media_type]['current_item_id']
-        if current_id is not None:
-            try:
+        if not hasattr(self, '_rating_mutex'):
+            self._rating_mutex = QMutex()
+                
+        if not self._rating_mutex.tryLock(1000):
+            QMessageBox.warning(self, "Error", "Rating submission in progress, please slow down.")
+            return
+                
+        try:
+            current_id = self.media_widgets[media_type]['current_item_id']
+            if current_id is not None:
+                if self.recommender.is_processing_feedback():
+                    QMessageBox.warning(self, "Please Wait", "Processing previous rating, please slow down.")
+                    return
+                        
                 cursor = self.db.conn.cursor()
-                cursor.execute('''
-                    SELECT * FROM media_items WHERE id = ?
-                ''', (current_id,))
+                cursor.execute('SELECT * FROM media_items WHERE id = ?', (current_id,))
                 row = cursor.fetchone()
                 if row:
                     columns = [description[0] for description in cursor.description]
                     content_data = dict(zip(columns, row))
                     
+                    
+                    if self.current_items[media_type] is not None:
+                        self.item_history[media_type].append(self.current_items[media_type])
+                        
                     self.recommender.train_with_feedback(current_id, rating, content_data)
-                    
-                    if hasattr(self, 'background_trainer') and self.background_trainer:
-                        self.background_trainer.queue_item_for_training(content_data, priority=True)
-                    
                     self.show_next_recommendation(media_type)
-                cursor.close()
-            except Exception as e:
-                self.logger.error(f"Error submitting rating: {e}")
-                QMessageBox.warning(self, "Error", f"Failed to submit rating: {str(e)}")
-       
+                        
+        except Exception as e:
+            self.logger.error(f"Error submitting rating: {e}")
+            QMessageBox.warning(self, "Error", f"Failed to submit rating: {str(e)}")
+                
+        finally:
+            self._rating_mutex.unlock()
+
+     
     def load_config(self):
         config_path = 'config.json'
         try:
@@ -1820,9 +1863,18 @@ class MediaRecommenderApp(QMainWindow):
     def skip_item(self, media_type):
         current_id = self.media_widgets[media_type]['current_item_id']
         if current_id is not None:
+            cursor = self.db.conn.cursor()
+            cursor.execute('SELECT * FROM media_items WHERE id = ?', (current_id,))
+            row = cursor.fetchone()
+            if row:
+                columns = [description[0] for description in cursor.description]
+                content_data = dict(zip(columns, row))
+                self.item_history[media_type].append(content_data)
+                
             self.skipped_items[media_type].add(current_id)
             print(f"Added {current_id} to skipped items for {media_type}")
             self.show_next_recommendation(media_type)
+
 
     def never_show_item(self, media_type):
         current_id = self.media_widgets[media_type]['current_item_id']
@@ -1883,11 +1935,39 @@ class MediaRecommenderApp(QMainWindow):
                 self.logger.error(f"Error resetting blocked items: {str(e)}")
                 QMessageBox.critical(self, "Error", f"Failed to reset blocked items: {str(e)}")
 
+    def show_previous_item(self, media_type: str):
+        try:
+            if not self.item_history[media_type]:
+                QMessageBox.information(
+                    self, 
+                    "No History", 
+                    "No previous items available to display."
+                )
+                return
+                
+            previous_item = self.item_history[media_type].pop()
+            print(f"Showing previous item: {previous_item.get('title')}")  
+            self.display_item(previous_item, media_type)
+            
+        except Exception as e:
+            self.logger.error(f"Error showing previous item: {e}")
+            QMessageBox.warning(
+                self, 
+                "Error", 
+                f"Failed to show previous item: {str(e)}"
+            )
+
+       
+
     def display_item(self, item: Optional[Dict], media_type: str) -> None:
         print(f"\nAttempting to display item for {media_type}")
         
         widgets = self.media_widgets[media_type]
         
+        if self.current_items[media_type] is not None:
+            self.item_history[media_type].append(self.current_items[media_type])
+        self.current_items[media_type] = item
+
         if not item or not isinstance(item, dict):
             print(f"No valid item to display for {media_type}")
             widgets['current_item_id'] = None
@@ -2115,28 +2195,81 @@ class MediaRecommenderApp(QMainWindow):
         progress_dialog.show()
         QApplication.processEvents()
 
-        cleanup_thread = QThread()
-        cleanup_worker = CleanupWorker(self)
-        cleanup_worker.moveToThread(cleanup_thread)
-        
-        cleanup_thread.started.connect(cleanup_worker.cleanup)
-        cleanup_worker.finished.connect(cleanup_thread.quit)
-        cleanup_worker.finished.connect(cleanup_worker.deleteLater)
-        cleanup_thread.finished.connect(cleanup_thread.deleteLater)
-        cleanup_worker.finished.connect(progress_dialog.close)
-        cleanup_worker.finished.connect(lambda: event.accept())
-        
-        QTimer.singleShot(10000, lambda: self._force_cleanup(cleanup_thread, event, progress_dialog))
-        
-        cleanup_thread.start()
+        try:
+            
+            if hasattr(self, 'scan_thread') and self.scan_thread:
+                self.scan_thread.stop()
+                self.scan_thread.wait(2000)  
+                
+            if hasattr(self, 'background_trainer') and self.background_trainer:
+                self.background_trainer.stop()
+                if self.background_trainer.isRunning():
+                    self.background_trainer.wait(2000)
+
+            if hasattr(self, 'recommender') and self.recommender:
+                
+                if hasattr(self.recommender, 'feedback_processor'):
+                    if hasattr(self.recommender.feedback_processor, 'stop'):
+                        self.recommender.feedback_processor.stop()
+                    if hasattr(self.recommender.feedback_processor, 'cleanup'):
+                        self.recommender.feedback_processor.cleanup()
+                
+                if hasattr(self.recommender, 'feedback_thread'):
+                    if self.recommender.feedback_thread.isRunning():
+                        self.recommender.feedback_thread.quit()
+                        self.recommender.feedback_thread.wait(2000)
+                self.recommender.cleanup()
+
+            
+            cleanup_thread = QThread()
+            cleanup_worker = CleanupWorker(self)
+            cleanup_worker.moveToThread(cleanup_thread)
+            
+            
+            cleanup_thread.started.connect(
+                lambda: self._safe_cleanup(cleanup_worker, status_label)
+            )
+            cleanup_worker.finished.connect(cleanup_thread.quit)
+            cleanup_worker.finished.connect(cleanup_worker.deleteLater)
+            cleanup_thread.finished.connect(cleanup_thread.deleteLater)
+            cleanup_worker.finished.connect(progress_dialog.close)
+            cleanup_worker.finished.connect(lambda: event.accept())
+            
+            
+            QTimer.singleShot(10000, 
+                lambda: self._force_cleanup(cleanup_thread, event, progress_dialog)
+            )
+            
+            
+            cleanup_thread.start()
+
+        except Exception as e:
+            self.logger.error(f"Error during shutdown: {str(e)}")
+            progress_dialog.close()
+            event.accept()
+
+    def _safe_cleanup(self, worker, status_label):
+        try:
+            worker.cleanup()
+        except Exception as e:
+            self.logger.error(f"Error in cleanup worker: {str(e)}")
+            status_label.setText(f"Error during cleanup: {str(e)}")
+            QApplication.processEvents()
 
     def _force_cleanup(self, thread: QThread, event: QCloseEvent, dialog: QDialog):
         if thread.isRunning():
             print("Cleanup taking too long, forcing shutdown...")
-            thread.terminate()
-            thread.wait(1000)
-            dialog.close()
-            event.accept()
+            try:
+                thread.quit()
+                if not thread.wait(1000):  
+                    thread.terminate()
+                    thread.wait()
+            except Exception as e:
+                self.logger.error(f"Error during forced cleanup: {str(e)}")
+            finally:
+                dialog.close()
+                event.accept()
+
 
     def update_progress(self, message):
         self.progress_text.append(message)
@@ -2229,57 +2362,70 @@ class MediaRecommenderApp(QMainWindow):
         QMessageBox.critical(self, title, message)
 
 class ContentEncoder(nn.Module):
-    def __init__(self, input_dim=1540, hidden_dim=384, output_dim=384):
+    def __init__(self, input_dim=None, hidden_dim=None, output_dim=None):
         super().__init__()
-        self.input_dim = 2180
-        print(f"Initializing ContentEncoder with dims: input={self.input_dim}, hidden={hidden_dim}, output={output_dim}")
         
-        self.fc1 = nn.Linear(self.input_dim, hidden_dim)
-        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.input_dim = 2564  
+        self.hidden_dim = 512  
+        self.output_dim = 384  
+        
+        print(f"Initializing ContentEncoder with dims: input={self.input_dim}, hidden={self.hidden_dim}, output={self.output_dim}")
+        
+        
+        self.fc1 = nn.Linear(self.input_dim, self.hidden_dim)
+        self.norm1 = nn.LayerNorm(self.hidden_dim)
         self.dropout1 = nn.Dropout(0.1)
         
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.norm2 = nn.LayerNorm(hidden_dim)
+        
+        self.fc2 = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self.norm2 = nn.LayerNorm(self.hidden_dim)
         self.dropout2 = nn.Dropout(0.1)
         
-        self.fc3 = nn.Linear(hidden_dim, output_dim)
-        self.norm3 = nn.LayerNorm(output_dim)
         
-        self.attention = nn.Linear(output_dim, 1)
+        self.fc3 = nn.Linear(self.hidden_dim, self.output_dim)
+        self.norm3 = nn.LayerNorm(self.output_dim)
+        
+        
+        self.attention = nn.Linear(self.output_dim, 1)
+        
         
         nn.init.xavier_uniform_(self.fc1.weight)
         nn.init.xavier_uniform_(self.fc2.weight)
         nn.init.xavier_uniform_(self.fc3.weight)
         nn.init.zeros_(self.attention.weight)
         
-        self.debug = True
+        self.debug = False
 
     def forward(self, x):
         if self.debug:
             print(f"\nContentEncoder forward pass:")
             print(f"Input shape: {x.shape}")
         
-        x = self.fc1(x)
-        if self.debug:
-            print(f"After fc1 shape: {x.shape}")
         
+        x = self.fc1(x)
         x = F.gelu(x)
         x = self.norm1(x)
         x = self.dropout1(x)
         
-        x = self.fc2(x)
         if self.debug:
-            print(f"After fc2 shape: {x.shape}")
+            print(f"After fc1 shape: {x.shape}")
         
+        
+        x = self.fc2(x)
         x = F.gelu(x)
         x = self.norm2(x)
         x = self.dropout2(x)
         
+        if self.debug:
+            print(f"After fc2 shape: {x.shape}")
+        
+        
         x = self.fc3(x)
+        x = self.norm3(x)
+        
         if self.debug:
             print(f"After fc3 shape: {x.shape}")
         
-        x = self.norm3(x)
         
         attention = torch.sigmoid(self.attention(x))
         x = x * attention
@@ -2331,26 +2477,40 @@ class TemporalEncoder(nn.Module):
         return x
 
 class MetadataEncoder(nn.Module):
-    def __init__(self, input_dim=384, hidden_dim=512, output_dim=256):
+    def __init__(self):
         super().__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.norm1 = nn.LayerNorm(hidden_dim)
+        
+        self.input_dim = 768
+        self.hidden_dim = 512
+        self.output_dim = 256
+        
+        
+        self.fc1 = nn.Linear(self.input_dim, self.hidden_dim)
+        self.norm1 = nn.LayerNorm(self.hidden_dim)
         self.dropout1 = nn.Dropout(0.1)
         
-        self.fc2 = nn.Linear(hidden_dim, output_dim)
-        self.norm2 = nn.LayerNorm(output_dim)
+        
+        self.fc2 = nn.Linear(self.hidden_dim, self.output_dim)
+        self.norm2 = nn.LayerNorm(self.output_dim)
+        
+        
+        nn.init.xavier_uniform_(self.fc1.weight)
+        nn.init.xavier_uniform_(self.fc2.weight)
 
     def forward(self, x):
+        
         x = F.gelu(self.fc1(x))
         x = self.norm1(x)
         x = self.dropout1(x)
+        
         
         x = self.fc2(x)
         x = self.norm2(x)
         return x
 
 class GraphConvNetwork(nn.Module):
-    def __init__(self, input_dim=384, hidden_dim=512, output_dim=341):
+    def __init__(self, input_dim=768, hidden_dim=512, output_dim=341):
+
         super().__init__()
         self.conv1 = GCNConv(input_dim, hidden_dim)
         self.norm1 = nn.LayerNorm(hidden_dim)
@@ -2360,37 +2520,45 @@ class GraphConvNetwork(nn.Module):
         self.norm2 = nn.LayerNorm(output_dim)
 
     def forward(self, x, edge_index):
+
         x = self.conv1(x, edge_index)
         x = F.gelu(x)
         x = self.norm1(x)
         x = self.dropout1(x)
+        
         
         x = self.conv2(x, edge_index)
         x = self.norm2(x)
         return x
 
 class GraphAttentionNetwork(nn.Module):
-    def __init__(self, input_dim=384, hidden_dim=512, output_dim=341, heads=4):
+    def __init__(self, input_dim=768, hidden_dim=512, output_dim=341, heads=4):
+
         super().__init__()
+        
         self.conv1 = GATConv(input_dim, hidden_dim // heads, heads=heads)
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.dropout1 = nn.Dropout(0.1)
+        
         
         self.conv2 = GATConv(hidden_dim, output_dim)
         self.norm2 = nn.LayerNorm(output_dim)
 
     def forward(self, x, edge_index):
+
         x = self.conv1(x, edge_index)
         x = F.gelu(x)
         x = self.norm1(x)
         x = self.dropout1(x)
+        
         
         x = self.conv2(x, edge_index)
         x = self.norm2(x)
         return x
 
 class GraphSageNetwork(nn.Module):
-    def __init__(self, input_dim=384, hidden_dim=512, output_dim=342):  
+    def __init__(self, input_dim=768, hidden_dim=512, output_dim=342):
+
         super().__init__()
         self.conv1 = GCNConv(input_dim, hidden_dim)
         self.norm1 = nn.LayerNorm(hidden_dim)
@@ -2400,6 +2568,7 @@ class GraphSageNetwork(nn.Module):
         self.norm2 = nn.LayerNorm(output_dim)
 
     def forward(self, x, edge_index):
+        
         x = self.conv1(x, edge_index)
         x = F.gelu(x)
         x = self.norm1(x)
@@ -2408,100 +2577,720 @@ class GraphSageNetwork(nn.Module):
         x = self.conv2(x, edge_index)
         x = self.norm2(x)
         return x
-
-class SimilarityWorker(QObject):
+    
+class GraphEdgeUpdater(QThread):
     progress = Signal(str)
     finished = Signal()
     error = Signal(str)
 
-    def __init__(self, engine, reference_item, candidates):
+    def __init__(self, recommender, node_id: str, content_data: Dict):
         super().__init__()
-        self.engine = engine
-        self.reference_item = reference_item
-        self.candidates = candidates
-        self._stop = False
+        self.recommender = recommender
+        self.node_id = node_id
+        self.content_data = content_data
+        self._stop_flag = False
+        self.logger = logging.getLogger(__name__)
 
-    def process_batch(self):
+    def run(self):
         try:
-            similarities = []
-            batch_size = 5
-            processed = 0
-            total = len(self.candidates)
+            
+            similar_items = self._compute_similarities()
+            
+            if self._stop_flag:
+                return
 
             
+            with self.recommender.graph_lock:
+                self._update_edges(similar_items)
+                
+            self.finished.emit()
+            
+        except Exception as e:
+            self.error.emit(str(e))
+            self.logger.error(f"Error updating graph edges: {str(e)}")
+
+    def _compute_similarities(self) -> List[Tuple[str, float]]:
+        try:
+            
             with torch.no_grad():
-                reference_embedding = self.engine._compute_embedding(self.reference_item)
+                reference_embedding = self.recommender._compute_embedding(self.content_data)
                 reference_cpu = reference_embedding.cpu()
                 reference_cpu = F.normalize(reference_cpu, p=2, dim=1).squeeze()
 
-            for i in range(0, total, batch_size):
-                if self._stop:
+            similar_items = []
+            candidates = self._get_candidate_items()
+            
+            
+            batch_size = 5
+            for i in range(0, len(candidates), batch_size):
+                if self._stop_flag:
                     break
-
-                batch = self.candidates[i:i + batch_size]
+                    
+                batch = candidates[i:i + batch_size]
                 batch_similarities = []
 
-                
-                for item in batch:
-                    if self._stop:
+                for candidate in batch:
+                    if self._stop_flag:
                         break
 
                     try:
-                        
                         with torch.no_grad():
-                            other_embedding = self.engine._compute_embedding(item)
-                            other_cpu = other_embedding.cpu()
-                            other_cpu = F.normalize(other_cpu, p=2, dim=1).squeeze()
+                            candidate_embedding = self.recommender._compute_embedding(candidate)
+                            candidate_cpu = candidate_embedding.cpu()
+                            candidate_cpu = F.normalize(candidate_cpu, p=2, dim=1).squeeze()
                             
-                            
-                            similarity = float(torch.dot(reference_cpu, other_cpu))
-                            batch_similarities.append((item['id'], item['title'], similarity))
-
-                            
-                            del other_embedding
-                            del other_cpu
-                            torch.cuda.empty_cache()
+                            similarity = float(torch.dot(reference_cpu, candidate_cpu))
+                            if similarity > 0.5:  
+                                batch_similarities.append((
+                                    f"media_{candidate['id']}", 
+                                    similarity
+                                ))
 
                     except Exception as e:
-                        self.engine.logger.error(f"Error processing item {item['id']}: {e}")
+                        self.logger.error(f"Error processing candidate: {str(e)}")
                         continue
 
-                
-                similarities.extend(batch_similarities)
-                processed += len(batch)
-                self.progress.emit(f"Processed {processed}/{total} items")
 
-                
-                if processed % 20 == 0:
-                    self.engine._store_similarities(
-                        self.reference_item['id'], 
-                        similarities,
-                        is_final=False
-                    )
+                similar_items.extend(batch_similarities)
+                progress = f"Processed {min(i + batch_size, len(candidates))}/{len(candidates)} items"
+                self.progress.emit(progress)
 
-            
-            if not self._stop:
-                self.engine._store_similarities(
-                    self.reference_item['id'], 
-                    similarities,
-                    is_final=True
+            return sorted(similar_items, key=lambda x: x[1], reverse=True)[:20]
+
+        except Exception as e:
+            self.logger.error(f"Error computing similarities: {str(e)}")
+            raise
+
+
+    def _get_candidate_items(self) -> List[Dict]:
+        cursor = self.recommender.db.conn.cursor()
+        
+        
+        query = '''
+            SELECT m.* FROM media_items m
+            WHERE m.type = ?
+            AND m.id != ?
+            AND (
+                m.genres LIKE ?
+                OR m.year BETWEEN ? AND ?
+                OR EXISTS (
+                    SELECT 1 FROM user_feedback f 
+                    WHERE f.media_id = m.id 
+                    AND f.rating >= 7
                 )
+            )
+            LIMIT 200
+        '''
+        
+        params = [
+            self.content_data['type'],
+            self.content_data['id'],
+            f"%{self.content_data.get('genres', '')}%",
+            int(self.content_data.get('year', 2000)) - 5,
+            int(self.content_data.get('year', 2000)) + 5
+        ]
+        
+        cursor.execute(query, params)
+        columns = [description[0] for description in cursor.description]
+        return [dict(zip(columns, row)) for row in cursor.fetchall()]
 
-            self.progress.emit("Similarity computation completed")
-            self.finished.emit()
+    def _update_edges(self, similar_items: List[Tuple[str, float]]) -> None:
+        
+        self.recommender.knowledge_graph['edges'][self.node_id] = []
+        
+        
+        for similar_id, similarity in similar_items:
+            edge_tuple = (similar_id, 'similar_to')
+            self.recommender.knowledge_graph['edges'][self.node_id].append(edge_tuple)
+            self.recommender.knowledge_graph['edge_types'].add('similar_to')
+            
+            
+            if similar_id not in self.recommender.knowledge_graph['edges']:
+                self.recommender.knowledge_graph['edges'][similar_id] = []
+            reciprocal_edge = (self.node_id, 'similar_to')
+            if reciprocal_edge not in self.recommender.knowledge_graph['edges'][similar_id]:
+                self.recommender.knowledge_graph['edges'][similar_id].append(reciprocal_edge)
+
+    def stop(self):
+        self._stop_flag = True
+
+class TextProcessor:
+    def __init__(self, device):
+        self.device = device
+        self.logger = logging.getLogger(__name__)
+        
+        
+        self.model = SentenceTransformer('sentence-transformers/all-mpnet-base-v2')
+        self.model.to('cpu')
+        self.model.eval()
+        
+        
+        self.max_seq_length = self.model.max_seq_length
+        
+        
+        self.tokenizer = self.model.tokenizer
+        
+    def encode_text(self, text: str) -> torch.Tensor:
+        try:
+            with torch.no_grad():
+                
+                embeddings = self.model.encode(
+                    text,
+                    convert_to_tensor=True,
+                    show_progress_bar=False,
+                    batch_size=1,
+                    normalize_embeddings=True
+                )
+                
+                
+                embeddings = embeddings.to('cpu')
+                if len(embeddings.shape) == 1:
+                    embeddings = embeddings.unsqueeze(0)
+                    
+                return embeddings
+                
+        except Exception as e:
+            self.logger.error(f"Error encoding text: {str(e)}")
+            return torch.zeros((1, self.model.get_sentence_embedding_dimension()), 
+                             device=self.device)
+    
+    def process_text_features(self, item: Dict) -> torch.Tensor:
+        try:
+            
+            text_fields = []
+            
+            
+            fields_to_process = {
+                'title': (item.get('title', ''), 1.5),  
+                'summary': (item.get('summary', ''), 1.0),
+                'overview': (item.get('overview', ''), 1.0),
+                'tagline': (item.get('tagline', ''), 0.8),
+                'keywords': (self._process_json_field(item.get('keywords', '[]')), 0.6),
+                'reviews': (self._process_json_field(item.get('reviews', '[]')), 0.4)
+            }
+            
+            
+            for (text, weight) in fields_to_process.values():
+                processed_text = self._safe_text_conversion(text)
+                if processed_text.strip():
+                    text_fields.append(processed_text)
+            
+            
+            combined_text = ' [SEP] '.join(text_fields) if text_fields else "unknown content"
+            
+            
+            if len(combined_text.split()) > self.max_seq_length:
+                words = combined_text.split()[:self.max_seq_length]
+                combined_text = ' '.join(words)
+            
+            
+            return self.encode_text(combined_text)
+            
+        except Exception as e:
+            self.logger.error(f"Error processing text features: {str(e)}")
+            return torch.zeros((1, self.model.get_sentence_embedding_dimension()), 
+                             device=self.device)
+    
+    def _safe_text_conversion(self, value: Any) -> str:
+        try:
+            if value is None:
+                return ""
+                
+            if isinstance(value, str):
+                return value.strip()
+                
+            if isinstance(value, (list, dict)):
+                try:
+                    if isinstance(value, list):
+                        text_items = []
+                        for item in value:
+                            if isinstance(item, dict):
+                                text_parts = []
+                                for key in ['name', 'content', 'overview', 'description']:
+                                    if key in item and item[key]:
+                                        text_parts.append(str(item[key]))
+                                if text_parts:
+                                    text_items.append(' '.join(text_parts))
+                                else:
+                                    text_items.append(str(item))
+                            else:
+                                text_items.append(str(item))
+                        return ' '.join(text_items)
+                    else:
+                        text_parts = []
+                        for key in ['name', 'content', 'overview', 'description']:
+                            if key in value and value[key]:
+                                text_parts.append(str(value[key]))
+                        return ' '.join(text_parts) if text_parts else str(value)
+                except Exception:
+                    return str(value)
+                    
+            return str(value).strip()
+            
+        except Exception as e:
+            self.logger.error(f"Error in safe text conversion: {str(e)}")
+            return ""
+            
+    def _process_json_field(self, field: Any) -> str:
+        try:
+            if not field:
+                return ""
+                
+            if isinstance(field, str):
+                try:
+                    parsed = json.loads(field)
+                    if isinstance(parsed, (list, dict)):
+                        return self._safe_text_conversion(parsed)
+                    return str(parsed)
+                except json.JSONDecodeError:
+                    return field
+                    
+            return self._safe_text_conversion(field)
+            
+        except Exception as e:
+            self.logger.error(f"Error processing JSON field: {str(e)}")
+            return ""
+
+class FeedbackProcessor(QObject):
+    finished = Signal()
+    progress = Signal(str)
+    error = Signal(str)
+
+    def __init__(self, recommender, media_id: int, rating: float, content_data: Dict):
+        super().__init__()
+        self.recommender = recommender
+        self.media_id = media_id
+        self.rating = rating
+        self.content_data = content_data.copy()
+        self.db = Database.get_instance()
+        self.logger = logging.getLogger(__name__)
+        self._stop_requested = False
+
+    def stop(self):
+        self._stop_requested = True
+
+    def process(self):
+        try:
+            if self._stop_requested:
+                return
+
+            self._save_feedback()
+            if self._stop_requested:
+                return
+            self.progress.emit("Feedback saved")
+
+            self._compute_and_cache_embedding()
+            if self._stop_requested:
+                return
+            self.progress.emit("Embedding cached")
+
+            self._queue_graph_update()
+            if self._stop_requested:
+                return
+            self.progress.emit("Graph updated")
+
+            self._update_genre_preferences()
+            if self._stop_requested:
+                return
+            self.progress.emit("Preferences updated")
 
         except Exception as e:
             self.error.emit(str(e))
+            self.logger.error(f"Error processing feedback: {str(e)}")
         finally:
-            
-            if 'reference_embedding' in locals():
-                del reference_embedding
-            if 'reference_cpu' in locals():
-                del reference_cpu
-            torch.cuda.empty_cache()
+            self.finished.emit()
 
-    def stop(self):
-        self._stop = True
+    def _save_feedback(self):
+        if self._stop_requested:
+            return
+        with self.recommender.preference_lock:
+            self.db.save_feedback(self.media_id, self.rating)
+
+    def _compute_and_cache_embedding(self):
+        if self._stop_requested:
+            return
+        try:
+            with torch.no_grad():
+                embedding_tensor = self.recommender._compute_embedding(self.content_data)
+                embedding_tensor = embedding_tensor.cpu().detach()
+                embedding_np = embedding_tensor.numpy().ravel()
+
+            with self.recommender.embeddings_lock:
+                self.db.save_embedding(self.media_id, embedding_np.tobytes())
+                
+            return embedding_tensor
+        except Exception as e:
+            raise Exception(f"Failed to compute embedding: {str(e)}")
+
+    def _queue_graph_update(self):
+        if self._stop_requested:
+            return
+        try:
+            node_id = f"media_{self.media_id}"
+            
+            with self.recommender.graph_lock:
+                if node_id not in self.recommender.knowledge_graph['nodes']:
+                    self.recommender.knowledge_graph['nodes'][node_id] = {
+                        'type': 'media',
+                        'data': {k: v for k, v in self.content_data.items() 
+                                if not isinstance(v, torch.Tensor)},
+                        'rating': float(self.rating)
+                    }
+                else:
+                    self.recommender.knowledge_graph['nodes'][node_id]['rating'] = float(self.rating)
+
+            if hasattr(self.recommender, 'edge_updater') and self.recommender.edge_updater.isRunning():
+                self.recommender.edge_updater.stop()
+                self.recommender.edge_updater.wait()
+
+            self.recommender.edge_updater = GraphEdgeUpdater(self.recommender, node_id, self.content_data)
+            self.recommender.edge_updater.start()
+
+        except Exception as e:
+            raise Exception(f"Failed to queue graph update: {str(e)}")
+
+    def _update_genre_preferences(self):
+        if self._stop_requested:
+            return
+        try:
+            genres = JSONUtils.process_json_field(self.content_data.get('genres', '[]'))
+            if not genres:
+                return
+
+            with self.recommender.preference_lock:
+                cursor = self.db.conn.cursor()
+                for genre in genres:
+                    if not genre:
+                        continue
+                    cursor.execute('''
+                        INSERT INTO genre_preferences (genre, rating_sum, rating_count)
+                        VALUES (?, ?, 1)
+                        ON CONFLICT(genre) DO UPDATE SET
+                            rating_sum = rating_sum + ?,
+                            rating_count = rating_count + 1
+                    ''', (genre, float(self.rating), float(self.rating)))
+                self.db.conn.commit()
+
+        except Exception as e:
+            raise Exception(f"Failed to update genre preferences: {str(e)}")
+
+class AdaptiveLearner:
+    def __init__(self, db):
+        self.db = db
+        self.learning_rate = 0.01
+        self.pattern_memory = defaultdict(float)
+        self.genre_affinities = defaultdict(float)
+        self.rating_distributions = {
+            'strong_dislike': (1, 3),
+            'dislike': (3, 5),
+            'like': (6, 8),
+            'strong_like': (8, 10)
+        }
+        self.logger = logging.getLogger(__name__)
+        try:
+            self._load_historical_patterns()
+        except Exception as e:
+            self.logger.error(f"Error in initialization: {e}")
+            self.pattern_memory = defaultdict(float)
+
+    def _safe_float_conversion(self, value, default=0.0):
+        if value is None:
+            return default
+            
+        if isinstance(value, (int, float)):
+            try:
+                return float(value)
+            except (ValueError, TypeError):
+                return default
+                
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except (ValueError, TypeError):
+                return default
+                
+        if isinstance(value, list):
+            if not value:
+                return default
+            for item in value:
+                try:
+                    return float(item)
+                except (ValueError, TypeError):
+                    continue
+                    
+        if isinstance(value, dict):
+            try:
+                if 'value' in value:
+                    return float(value['value'])
+                if 'rating' in value:
+                    return float(value['rating'])
+            except (ValueError, TypeError):
+                pass
+                
+        return default
+
+    def _load_historical_patterns(self):
+        try:
+            cursor = self.db.conn.cursor()
+            cursor.execute("""
+                SELECT m.*, f.rating 
+                FROM media_items m
+                JOIN user_feedback f ON m.id = f.media_id
+            """)
+            
+            columns = [description[0] for description in cursor.description]
+            rows = cursor.fetchall()
+            
+            items = []
+            for row in rows:
+                item_dict = dict(zip(columns, row))
+                rating = self._safe_float_conversion(item_dict.get('rating'))
+                items.append((item_dict, rating))
+                
+            self._analyze_patterns(items)
+            
+        except Exception as e:
+            self.logger.error(f"Error loading patterns: {e}")
+            self.pattern_memory = defaultdict(float)
+
+    def _analyze_patterns(self, items):
+        try:
+            for item_data, rating in items:
+                features = self._extract_dynamic_features(item_data)
+                if features:
+                    adjustment = 1.0 if rating > 5 else -1.0
+                    self._update_patterns(features, adjustment)
+        except Exception as e:
+            self.logger.error(f"Error analyzing patterns: {e}")
+            self.pattern_memory = defaultdict(float)
+
+    def _analyze_rating_distribution(self):
+        try:
+            cursor = self.db.conn.cursor()
+            cursor.execute("SELECT rating, COUNT(*) FROM user_feedback GROUP BY rating")
+            ratings = cursor.fetchall()
+            
+            total = sum(count for _, count in ratings)
+            if not total:
+                return {}
+                
+            distribution = defaultdict(float)
+            for rating, count in ratings:
+                rating_float = self._safe_float_conversion(rating)
+                for category, (min_val, max_val) in self.rating_distributions.items():
+                    if min_val <= rating_float <= max_val:
+                        distribution[category] = count / total
+                        
+            return dict(distribution)
+            
+        except Exception as e:
+            self.logger.error(f"Error in rating distribution: {e}")
+            return {}
+
+    def _extract_rating_patterns(self):
+        try:
+            cursor = self.db.conn.cursor()
+            cursor.execute("""
+                SELECT m.genres, AVG(f.rating) as avg_rating, COUNT(*) as count
+                FROM user_feedback f
+                JOIN media_items m ON f.media_id = m.id
+                GROUP BY m.genres
+            """)
+            
+            patterns = {}
+            for genres, avg_rating, count in cursor.fetchall():
+                if not genres:
+                    continue
+                    
+                try:
+                    genre_list = json.loads(genres) if isinstance(genres, str) else genres
+                    for genre in genre_list:
+                        genre_name = genre.get('name', genre) if isinstance(genre, dict) else str(genre)
+                        if genre_name:
+                            patterns[f"genre_{genre_name}"] = {
+                                'avg_rating': self._safe_float_conversion(avg_rating),
+                                'confidence': min(1.0, self._safe_float_conversion(count) / 5)
+                            }
+                except json.JSONDecodeError:
+                    continue
+                    
+            return patterns
+            
+        except Exception as e:
+            self.logger.error(f"Error extracting patterns: {e}")
+            return {}
+
+    def learn_from_feedback(self, media_id, rating):
+        try:
+            cursor = self.db.conn.cursor()
+            cursor.execute('SELECT * FROM media_items WHERE id = ?', (media_id,))
+            row = cursor.fetchone()
+            
+            if not row:
+                return
+                
+            columns = [description[0] for description in cursor.description]
+            item = dict(zip(columns, row))
+            
+            rating = self._safe_float_conversion(rating, default=5.0)
+            rating_weight = self._calculate_rating_weight(rating)
+            temporal_bias = self._calculate_temporal_bias(item)
+            adjustment = self.learning_rate * rating_weight * temporal_bias
+            
+            features = self._extract_dynamic_features(item)
+            if features:
+                self._update_patterns(features, adjustment)
+                self._update_preferences(features, rating)
+            
+        except Exception as e:
+            self.logger.error(f"Error processing feedback: {e}")
+
+    def _update_patterns(self, features, adjustment):
+        if not features:
+            return
+            
+        try:
+            adjustment = self._safe_float_conversion(adjustment)
+            for feature_type, values in features.items():
+                if isinstance(values, (list, set)):
+                    for value in values:
+                        if value:
+                            key = f"{feature_type}_{value}"
+                            self.pattern_memory[key] += adjustment
+                elif isinstance(values, dict):
+                    for key, value in values.items():
+                        if key and value:
+                            pattern_key = f"{feature_type}_{key}"
+                            value_float = self._safe_float_conversion(value)
+                            self.pattern_memory[pattern_key] += adjustment * value_float
+                            
+        except Exception as e:
+            self.logger.error(f"Error updating patterns: {e}")
+
+    def _update_preferences(self, features, rating):
+        try:
+            rating = self._safe_float_conversion(rating, default=5.0)
+            rating_weight = self._calculate_rating_weight(rating)
+            
+            genres = features.get('genres', [])
+            if isinstance(genres, str):
+                try:
+                    genres = json.loads(genres)
+                except json.JSONDecodeError:
+                    genres = [genres]
+                    
+            if not isinstance(genres, (list, set)):
+                genres = [genres]
+                
+            for genre in genres:
+                genre_name = genre.get('name', genre) if isinstance(genre, dict) else str(genre)
+                if genre_name:
+                    cursor = self.db.conn.cursor()
+                    cursor.execute('''
+                        INSERT INTO genre_preferences (genre, rating_sum, rating_count)
+                        VALUES (?, ?, 1)
+                        ON CONFLICT(genre) DO UPDATE SET
+                            rating_sum = rating_sum + ?,
+                            rating_count = rating_count + 1
+                    ''', (genre_name, rating, rating))
+                    self.db.conn.commit()
+                    
+        except Exception as e:
+            self.logger.error(f"Error updating preferences: {e}")
+
+    def _calculate_temporal_bias(self, item):
+        try:
+            current_year = datetime.now().year
+            item_year = self._safe_float_conversion(item.get('year', current_year))
+            years_diff = current_year - item_year
+            
+            if years_diff <= 1:
+                return 1.2
+            elif years_diff <= 5:
+                return 1.1
+            elif years_diff <= 10:
+                return 1.0
+            elif years_diff <= 20:
+                return 0.9
+            else:
+                return 0.8
+                
+        except Exception as e:
+            self.logger.error(f"Error in temporal bias: {e}")
+            return 1.0
+
+    def _calculate_rating_weight(self, rating):
+        try:
+            rating = self._safe_float_conversion(rating, default=5.0)
+            if rating <= 3:
+                return -2.0
+            elif rating <= 5:
+                return -1.0
+            elif rating <= 8:
+                return 1.0
+            else:
+                return 2.0
+        except Exception as e:
+            self.logger.error(f"Error calculating rating weight: {e}")
+            return 0.0
+
+    def _extract_dynamic_features(self, item):
+        if not item:
+            return {}
+            
+        try:
+            features = {}
+            for key, value in item.items():
+                if key in ['id', 'last_recommended', 'is_blocked']:
+                    continue
+                    
+                if isinstance(value, str):
+                    try:
+                        features[key] = json.loads(value)
+                    except json.JSONDecodeError:
+                        features[key] = [w for w in value.lower().split() if len(w) > 3]
+                else:
+                    features[key] = value
+            return features
+            
+        except Exception as e:
+            self.logger.error(f"Error extracting features: {e}")
+            return {}
+
+    def get_recommendation_score(self, item):
+        try:
+            features = self._extract_dynamic_features(item)
+            if not features:
+                return 0.0
+                
+            score = 0.0
+            feature_count = 0
+            
+            for feature_type, values in features.items():
+                if isinstance(values, (list, set)):
+                    for value in values:
+                        if value:
+                            key = f"{feature_type}_{value}"
+                            score += self.pattern_memory[key]
+                            feature_count += 1
+                elif isinstance(values, dict):
+                    for key, value in values.items():
+                        if key and value:
+                            pattern_key = f"{feature_type}_{key}"
+                            value_float = self._safe_float_conversion(value)
+                            score += self.pattern_memory[pattern_key] * value_float
+                            feature_count += 1
+                            
+            temporal_bias = self._calculate_temporal_bias(item)
+            
+            if feature_count > 0:
+                final_score = (score / feature_count) * temporal_bias
+                return max(0.0, min(10.0, final_score + 5.0))
+            return 5.0
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating recommendation score: {e}")
+            return 5.0
 
 class WatchlistClearWorker(QThread):
     progress = Signal(str)
@@ -2605,17 +3394,21 @@ class RecommendationEngine:
     def __init__(self, db):
         self.db = db
         self.logger = logging.getLogger(__name__)
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = torch.device('cpu')
+        
         self.embeddings_lock = threading.Lock()
         self.preference_lock = threading.Lock()
         self.graph_lock = threading.Lock()
+        self.tensor_lock = threading.Lock()
+        self.training_lock = threading.Lock()
+        self.is_processing = threading.Event()
+        
         self.embedding_cache = {}
         self.similarity_matrix = None
         self.last_matrix_update = None
-        self.tensor_lock = threading.Lock()
-        self.skipped_items = {'movie': set(), 'show': set()} 
+        self.skipped_items = {'movie': set(), 'show': set()}
         self.blocked_items = set()
-        self.json_utils = JSONUtils()
+        self.adaptive_learner = AdaptiveLearner(db)
         
         try:
             cursor = self.db.conn.cursor()
@@ -2625,15 +3418,16 @@ class RecommendationEngine:
         except Exception as e:
             self.logger.error(f"Error loading blocked items: {str(e)}")
             self.blocked_items = set()
-
+        
         try:
             nltk.download('wordnet', quiet=True)
             nltk.download('averaged_perceptron_tagger', quiet=True)
             nltk.download('punkt', quiet=True)
         except Exception as e:
             self.logger.warning(f"Could not download NLTK data: {e}")
-            
+        
         self._setup_models()
+        
         self.knowledge_graph = self._initialize_knowledge_graph()
         
         self.optimizer = torch.optim.Adam([
@@ -2645,61 +3439,59 @@ class RecommendationEngine:
         ], lr=1e-4, weight_decay=0.01)
         
         self.criterion = nn.MSELoss()
-        
-        self.prediction_head = nn.Sequential(
-            nn.Linear(384, 256),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(256, 1)
-        ).to(self.device)
+
 
     def _compute_graph_features(self, item: Dict) -> torch.Tensor:
         try:
             with self.graph_lock:
                 if 'id' not in item:
                     self.logger.error("Item missing ID for graph features")
-                    return torch.zeros((1, 384), device=self.device)
+                    return torch.zeros((1, 1024), device=self.device)
                     
                 node_id = f"media_{item['id']}"
                 
                 if node_id not in self.knowledge_graph['nodes']:
                     self.logger.warning(f"Node {node_id} not found in knowledge graph")
-                    return torch.zeros((1, 384), device=self.device)
+                    return torch.zeros((1, 1024), device=self.device)
                     
                 subgraph = self._extract_subgraph(node_id)
                 if not subgraph['nodes']:
                     self.logger.warning(f"Empty subgraph for node {node_id}")
-                    return torch.zeros((1, 384), device=self.device)
+                    return torch.zeros((1, 1024), device=self.device)
                     
                 edge_index, edge_type, node_features = self._prepare_graph_data(subgraph)
 
                 with torch.no_grad():
                     features = []
                     
+                    
                     try:
                         graph_embedding = self.graph_conv(node_features, edge_index)
                         graph_embedding = graph_embedding.mean(dim=0, keepdim=True)
                         features.append(graph_embedding)
                     except Exception as e:
-                        self.logger.error(f"Error computing GCN features: {str(e)}")
+                        self.logger.error(f"GCN error: {str(e)}")
                         features.append(torch.zeros((1, 341), device=self.device))
 
+                    
                     try:
                         attention_embedding = self.graph_attention(node_features, edge_index)
                         attention_embedding = attention_embedding.mean(dim=0, keepdim=True)
                         features.append(attention_embedding)
                     except Exception as e:
-                        self.logger.error(f"Error computing GAT features: {str(e)}")
+                        self.logger.error(f"GAT error: {str(e)}")
                         features.append(torch.zeros((1, 341), device=self.device))
 
+                    
                     try:
                         sage_embedding = self.graph_sage(node_features, edge_index)
                         sage_embedding = sage_embedding.mean(dim=0, keepdim=True)
                         features.append(sage_embedding)
                     except Exception as e:
-                        self.logger.error(f"Error computing GraphSAGE features: {str(e)}")
+                        self.logger.error(f"GraphSAGE error: {str(e)}")
                         features.append(torch.zeros((1, 342), device=self.device))
 
+                    
                     combined_embedding = torch.cat(features, dim=1)
                     combined_embedding = combined_embedding.detach()
 
@@ -2707,22 +3499,24 @@ class RecommendationEngine:
 
         except Exception as e:
             self.logger.error(f"Error computing graph features: {str(e)}")
-            return torch.zeros((1, 384), device=self.device)
+            return torch.zeros((1, 1024), device=self.device)
         finally:
+            
             if 'edge_index' in locals(): del edge_index
             if 'edge_type' in locals(): del edge_type
             if 'node_features' in locals(): del node_features
             if 'graph_embedding' in locals(): del graph_embedding
             if 'attention_embedding' in locals(): del attention_embedding
             if 'sage_embedding' in locals(): del sage_embedding
-            torch.cuda.empty_cache()
-    
+
+            
     def _load_embedding(self, media_id: int) -> Optional[torch.Tensor]:
         try:
             cached_embedding = self.db.load_embedding(media_id)
             if cached_embedding is not None:
-                array = np.frombuffer(cached_embedding, dtype=np.float32).copy() 
-                tensor = torch.from_numpy(array).to(self.device)
+                
+                array = np.frombuffer(cached_embedding, dtype=np.float32).copy()
+                tensor = torch.from_numpy(array).to('cpu')
                 return tensor.view(1, -1)
             return None
         except Exception as e:
@@ -2731,33 +3525,38 @@ class RecommendationEngine:
 
     def _setup_models(self):
         try:
-            self.tokenizer = AutoTokenizer.from_pretrained("microsoft/MiniLM-L12-H384-uncased")
-            self.text_encoder = AutoModel.from_pretrained("microsoft/MiniLM-L12-H384-uncased")
-            self.text_encoder.to(self.device)
             
-            self.content_encoder = ContentEncoder(
-                input_dim=1540,
-                hidden_dim=384,
-                output_dim=384
-            ).to(self.device)
+            self.text_processor = TextProcessor('cpu')
             
-            self.genre_encoder = GenreEncoder().to(self.device)
-            self.temporal_encoder = TemporalEncoder().to(self.device)
-            self.metadata_encoder = MetadataEncoder().to(self.device)
             
-            self.graph_conv = GraphConvNetwork().to(self.device)
-            self.graph_attention = GraphAttentionNetwork().to(self.device)
-            self.graph_sage = GraphSageNetwork().to(self.device)
+            self.content_encoder = ContentEncoder().to('cpu')
             
-            for model in [self.text_encoder, self.content_encoder, self.genre_encoder,
-                        self.temporal_encoder, self.metadata_encoder, self.graph_conv,
-                        self.graph_attention, self.graph_sage]:
+            
+            self.genre_encoder = GenreEncoder().to('cpu')
+            self.temporal_encoder = TemporalEncoder().to('cpu')
+            self.metadata_encoder = MetadataEncoder().to('cpu')
+            
+            
+            self.graph_conv = GraphConvNetwork().to('cpu')
+            self.graph_attention = GraphAttentionNetwork().to('cpu')
+            self.graph_sage = GraphSageNetwork().to('cpu')
+            
+            
+            for model in [
+                self.content_encoder,
+                self.genre_encoder,
+                self.temporal_encoder,
+                self.metadata_encoder,
+                self.graph_conv,
+                self.graph_attention,
+                self.graph_sage
+            ]:
                 model.eval()
                 
         except Exception as e:
             self.logger.error(f"Error setting up models: {str(e)}")
             raise
-
+        
     def _extract_entities(self, text: str) -> List[str]:
         try:
             tokens = nltk.word_tokenize(text)
@@ -2821,8 +3620,7 @@ class RecommendationEngine:
                 {'params': self.metadata_encoder.parameters(), 'lr': 1e-4},
                 {'params': self.graph_conv.parameters(), 'lr': 1e-4},
                 {'params': self.graph_attention.parameters(), 'lr': 1e-4},
-                {'params': self.graph_sage.parameters(), 'lr': 1e-4},
-                {'params': self.prediction_head.parameters(), 'lr': 1e-4}
+                {'params': self.graph_sage.parameters(), 'lr': 1e-4}
             ], weight_decay=0.01)
             
             
@@ -2978,30 +3776,6 @@ class RecommendationEngine:
             self.graph_attention.load_state_dict(state['graph_attention'])
             self.graph_sage.load_state_dict(state['graph_sage'])
             self.prediction_head.load_state_dict(state['prediction_head'])
-
-    def _update_genre_preferences(self, genres: List[str], rating: float) -> None:
-        try:
-            with self.preference_lock:
-                cursor = self.db.conn.cursor()
-                
-                for genre in genres:
-                    if not genre:  
-                        continue
-                        
-                    cursor.execute('''
-                        INSERT INTO genre_preferences (genre, rating_sum, rating_count)
-                        VALUES (?, ?, 1)
-                        ON CONFLICT(genre) DO UPDATE SET
-                            rating_sum = rating_sum + ?,
-                            rating_count = rating_count + 1
-                    ''', (genre, float(rating), float(rating)))
-                        
-                self.db.conn.commit()
-                print(f"Updated preferences for genres: {genres}")
-                
-        except Exception as e:
-            self.logger.error(f"Error updating genre preferences: {str(e)}")
-            print(f"Error in genre preference update: {e}")
             
     def _get_candidates(self, media_type: str) -> List[int]:
         cursor = self.db.conn.cursor()
@@ -3065,98 +3839,6 @@ class RecommendationEngine:
             self.logger.error(f"Error getting candidates: {str(e)}")
             print(f"Database error in _get_candidates: {str(e)}")
             return []
-
-    def _get_content_based_scores(self, candidates):
-        scores = {}
-        cursor = self.db.conn.cursor()
-        for item_id in candidates:
-            cursor.execute('SELECT * FROM media_items WHERE id = ?', (item_id,))
-            columns = [description[0] for description in cursor.description]
-            item_data = dict(zip(columns, cursor.fetchone()))
-            item_embedding = self._compute_embedding(item_data)
-            
-            similarity_scores = []
-            cursor.execute('''
-                SELECT m.* FROM media_items m
-                JOIN user_feedback f ON m.id = f.media_id
-                WHERE f.rating >= 7
-            ''')
-            rated_items = [dict(zip(columns, row)) for row in cursor.fetchall()]
-            
-            for rated_item in rated_items:
-                rated_embedding = self._compute_embedding(rated_item)
-                similarity = F.cosine_similarity(
-                    item_embedding.unsqueeze(0),
-                    rated_embedding.unsqueeze(0)
-                ).item()
-                similarity_scores.append(similarity)
-            
-            scores[item_id] = max(similarity_scores) if similarity_scores else 0
-        
-        return scores
-
-    def _get_graph_based_scores(self, candidates):
-        scores = {}
-        for item_id in candidates:
-            node_id = f"media_{item_id}"
-            subgraph = self._extract_subgraph(node_id)
-            edge_index, edge_type, node_features = self._prepare_graph_data(subgraph)
-            
-            with torch.no_grad():
-                graph_embedding = self.graph_sage(node_features, edge_index)[0]
-            
-            similarity_scores = []
-            cursor = self.db.conn.cursor()
-            cursor.execute('''
-                SELECT m.* FROM media_items m
-                JOIN user_feedback f ON m.id = f.media_id
-                WHERE f.rating >= 7
-            ''')
-            columns = [description[0] for description in cursor.description]
-            rated_items = [dict(zip(columns, row)) for row in cursor.fetchall()]
-            
-            for rated_item in rated_items:
-                rated_node_id = f"media_{rated_item['id']}"
-                rated_subgraph = self._extract_subgraph(rated_node_id)
-                rated_edge_index, rated_edge_type, rated_node_features = self._prepare_graph_data(rated_subgraph)
-                
-                with torch.no_grad():
-                    rated_graph_embedding = self.graph_sage(rated_node_features, rated_edge_index)[0]
-                
-                similarity = F.cosine_similarity(
-                    graph_embedding.unsqueeze(0),
-                    rated_graph_embedding.unsqueeze(0)
-                ).item()
-                similarity_scores.append(similarity)
-            
-            scores[item_id] = max(similarity_scores) if similarity_scores else 0
-        
-        return scores
-
-    def _get_collaborative_scores(self, candidates):
-        if self.similarity_matrix is None:
-            self._update_similarity_matrix()
-        
-        scores = {}
-        cursor = self.db.conn.cursor()
-        
-        for item_id in candidates:
-            cursor.execute('''
-                SELECT m.*, f.rating FROM media_items m
-                JOIN user_feedback f ON m.id = f.media_id
-            ''')
-            columns = [description[0] for description in cursor.description]
-            rated_items = [dict(zip(columns, row)) for row in cursor.fetchall()]
-            
-            item_scores = []
-            for rated_item in rated_items:
-                similarity = self.similarity_matrix[item_id, rated_item['id']].item()
-                rating = rated_item['rating']
-                item_scores.append(similarity * rating)
-            
-            scores[item_id] = sum(item_scores) / len(item_scores) if item_scores else 0
-        
-        return scores
 
     def get_next_recommendation(self, media_type: str) -> Optional[Dict]:
         try:
@@ -3242,6 +3924,10 @@ class RecommendationEngine:
 
     def _calculate_item_score(self, item_data: Dict) -> float:
         try:
+            
+            adaptive_score = self.adaptive_learner.get_recommendation_score(item_data)
+            
+            
             popularity = float(item_data.get('popularity', 0))
             vote_average = float(item_data.get('vote_average', 0))
             vote_count = float(item_data.get('vote_count', 0))
@@ -3252,18 +3938,24 @@ class RecommendationEngine:
             
             genre_bonus = self._calculate_genre_match_bonus(item_data.get('genres', '[]'))
             
-            score = (
+            
+            traditional_score = (
                 0.35 * norm_popularity + 
                 0.35 * norm_vote_avg + 
                 0.20 * norm_votes +
                 0.10 * genre_bonus
             ) * 100
             
-            return score
             
+            final_score = (adaptive_score + traditional_score) / 2
+            
+            return final_score
+                
         except Exception as e:
             self.logger.error(f"Error calculating item score: {str(e)}")
             return 0.0
+
+
 
     def _calculate_genre_match_bonus(self, genres_json: str) -> float:
         try:
@@ -3298,209 +3990,130 @@ class RecommendationEngine:
         except Exception as e:
             self.logger.error(f"Error calculating genre bonus: {str(e)}")
             return 0.0
-        
-    def train_with_feedback(self, media_id: int, rating: float, content_data: Dict) -> None:
-            try:
-                print(f"\nProcessing feedback for item {media_id} with rating {rating}")
 
-                
-                self.db.save_feedback(media_id, rating)
-                print("Feedback saved to database")
-
-                
-                with torch.no_grad():
-                    embedding_tensor = self._compute_embedding(content_data)
-                    embedding_tensor = embedding_tensor.cpu().detach()
-                    embedding_np = embedding_tensor.numpy().ravel()
-                    
-                self.db.save_embedding(media_id, embedding_np.tobytes())
-                print("Embedding saved to cache")
-
-                
-                self._update_knowledge_graph(media_id, rating, content_data)
-                print(f"Updated knowledge graph for {content_data.get('title', 'Unknown')}")
-
-                
-                try:
-                    
-                    if hasattr(self, 'similarity_thread') and self.similarity_thread.isRunning():
-                        self.similarity_thread.quit()
-                        self.similarity_thread.wait()
-
-                    
-                    self.similarity_thread = QThread()
-                    targeted_items = self._get_targeted_candidates(content_data)
-                    self.similarity_worker = SimilarityWorker(self, content_data, targeted_items)
-
-                    
-                    self.similarity_worker.moveToThread(self.similarity_thread)
-
-                    
-                    self.similarity_thread.started.connect(self.similarity_worker.process_batch)
-                    self.similarity_worker.finished.connect(self.similarity_thread.quit)
-                    self.similarity_worker.finished.connect(self.similarity_worker.deleteLater)
-                    
-                    self.similarity_worker.progress.connect(lambda msg: print(msg))
-                    self.similarity_worker.error.connect(lambda msg: print(f"Error: {msg}"))
-
-                    
-                    print(f"Computing similarities for {len(targeted_items)} targeted candidates...")
-                    self.similarity_thread.start()
-
-                except Exception as e:
-                    print(f"Error starting similarity computation: {e}")
-
-                
-                genres = self._process_json_field(content_data.get('genres', '[]'))
-                self._update_genre_preferences(genres, rating)
-                print("Genre preferences updated")
-
-            except Exception as e:
-                self.logger.error(f"Error training with feedback: {str(e)}")
-                print(f"Error in feedback processing: {str(e)}")
-            
-    def _get_temporal_scores(self, candidates):
-        scores = {}
-        current_year = datetime.now().year
-        
-        cursor = self.db.conn.cursor()
-        for item_id in candidates:
-            cursor.execute('SELECT year FROM media_items WHERE id = ?', (item_id,))
-            year = cursor.fetchone()[0]
-            
-            if year:
-                age = current_year - int(year)
-                temporal_score = 1.0 / (1.0 + 0.1 * age)
-                scores[item_id] = temporal_score
-            else:
-                scores[item_id] = 0.5
-        
-        return scores
-
-    def _get_method_weights(self) -> Dict[str, float]:
+    def train_with_feedback(self, media_id: int, rating: float, content_data: Dict):
         try:
-            cursor = self.db.conn.cursor()
-            cursor.execute('''
-                SELECT AVG(rating) as avg_rating,
-                       COUNT(*) as rating_count
-                FROM user_feedback
-            ''')
-            metrics = cursor.fetchone()
+            if not self.training_lock.acquire(timeout=5):
+                raise TimeoutError("Could not acquire training lock")
+                
+            print(f"\nProcessing feedback for item {media_id} with rating {rating}")
+            self._cleanup_existing_processor()
+            self.adaptive_learner.learn_from_feedback(media_id, rating)
+            self.is_processing.set()
+            self.feedback_processor = FeedbackProcessor(self, media_id, rating, content_data)
+            self.feedback_thread = QThread()
+            self.feedback_processor.moveToThread(self.feedback_thread)
+            self.feedback_thread.started.connect(self.feedback_processor.process)
+            self.feedback_processor.finished.connect(self.feedback_thread.quit)
+            self.feedback_processor.finished.connect(self.feedback_processor.deleteLater)
+            self.feedback_thread.finished.connect(self.feedback_thread.deleteLater)
+            self.feedback_processor.finished.connect(
+                lambda: self._handle_feedback_completion(media_id)
+            )
             
-            if not metrics or metrics[1] == 0:
-                return {
-                    'content': 0.4,
-                    'graph': 0.3,
-                    'collaborative': 0.2,
-                    'temporal': 0.1
-                }
-            
-            avg_rating = metrics[0]
-            rating_count = metrics[1]
-            
-            content_weight = 0.4 * (avg_rating / 10)
-            graph_weight = 0.3 * min(1.0, rating_count / 100)
-            collaborative_weight = 0.2 * min(1.0, rating_count / 50)
-            temporal_weight = 0.1
-            
-            total = content_weight + graph_weight + collaborative_weight + temporal_weight
-            
-            return {
-                'content': content_weight / total,
-                'graph': graph_weight / total,
-                'collaborative': collaborative_weight / total,
-                'temporal': temporal_weight / total
-            }
+            self.feedback_thread.start()
             
         except Exception as e:
-            self.logger.error(f"Error calculating method weights: {str(e)}")
-            return {'content': 0.4, 'graph': 0.3, 'collaborative': 0.2, 'temporal': 0.1}
+            self._release_locks()
+            self.logger.error(f"Error initiating feedback processing: {str(e)}")
+            print(f"Error in feedback processing: {str(e)}")
 
-    def _update_similarity_matrix(self) -> None:
+
+    def _cleanup_existing_processor(self):
         try:
-            current_time = datetime.now()
-            if (self.last_matrix_update is None or
-                (current_time - self.last_matrix_update).total_seconds() > 3600):
-                
-                cursor = self.db.conn.cursor()
-                cursor.execute('SELECT id FROM media_items')
-                item_ids = [row[0] for row in cursor.fetchall()]
-                
-                matrix_size = len(item_ids)
-                self.similarity_matrix = torch.zeros((matrix_size, matrix_size), device=self.device)
-                
-                batch_size = 50
-                for i in range(0, matrix_size, batch_size):
-                    batch_ids = item_ids[i:i + batch_size]
-                    embeddings_i = []
+            if hasattr(self, 'feedback_processor'):
+                if not shiboken6.isValid(self.feedback_processor):
+                    delattr(self, 'feedback_processor')
+                    return
                     
-                    for item_id in batch_ids:
-                        cursor.execute('SELECT * FROM media_items WHERE id = ?', (item_id,))
-                        columns = [description[0] for description in cursor.description]
-                        item_data = dict(zip(columns, cursor.fetchone()))
-                        embedding = self._compute_embedding(item_data)
-                        
-                        embedding = embedding.squeeze(0)  
-                        embeddings_i.append(embedding)
+                if hasattr(self.feedback_processor, 'stop'):
+                    self.feedback_processor.stop()
                     
-                    if embeddings_i:
-                        embeddings_i = torch.stack(embeddings_i)  
-                        
-                        for j in range(0, matrix_size, batch_size):
-                            batch_ids_j = item_ids[j:j + batch_size]
-                            embeddings_j = []
+            if hasattr(self, 'feedback_thread'):
+                if not shiboken6.isValid(self.feedback_thread):
+                    delattr(self, 'feedback_thread')
+                    return
+                    
+                if self.feedback_thread.isRunning():
+                    self.feedback_thread.quit()
+                    if not self.feedback_thread.wait(1000):  
+                        try:
+                            self.feedback_thread.terminate()
+                            self.feedback_thread.wait()
+                        except RuntimeError:
+                            pass  
                             
-                            for item_id in batch_ids_j:
-                                cursor.execute('SELECT * FROM media_items WHERE id = ?', (item_id,))
-                                columns = [description[0] for description in cursor.description]
-                                item_data = dict(zip(columns, cursor.fetchone()))
-                                embedding = self._compute_embedding(item_data)
-                                embedding = embedding.squeeze(0)  
-                                embeddings_j.append(embedding)
-                            
-                            if embeddings_j:
-                                embeddings_j = torch.stack(embeddings_j)  
-                                
-                                
-                                similarities = F.cosine_similarity(
-                                    embeddings_i.unsqueeze(1),  
-                                    embeddings_j.unsqueeze(0),  
-                                    dim=2  
-                                )
-                                
-                                
-                                i_end = min(i + batch_size, matrix_size)
-                                j_end = min(j + batch_size, matrix_size)
-                                self.similarity_matrix[i:i_end, j:j_end] = similarities
-                
-                self.last_matrix_update = current_time
+        except Exception as e:
+            self.logger.error(f"Error cleaning up processor: {str(e)}")
+        finally:
+            
+            if hasattr(self, 'feedback_processor'):
+                delattr(self, 'feedback_processor')
+            if hasattr(self, 'feedback_thread'):
+                delattr(self, 'feedback_thread')
+
+    def _release_locks(self):
+        self.is_processing.clear()  
+        try:
+            self.training_lock.release()
+        except RuntimeError:
+            
+            pass
+
+    def is_processing_feedback(self):
+        return self.is_processing.is_set()
+
+    def _safe_process(self, processor):
+        try:
+            processor.process()
+        except Exception as e:
+            self.logger.error(f"Error in feedback processing: {str(e)}")
+    
+    def _handle_feedback_completion(self, media_id: int):
+        try:
+            print(f"Feedback processing completed for item {media_id}")
+            
+            
+            self._release_locks()
+            
+            
+            if hasattr(self, 'background_trainer') and self.background_trainer:
+                self.background_trainer.queue_item_for_training(media_id, priority=True)
                 
         except Exception as e:
-            self.logger.error(f"Error updating similarity matrix: {str(e)}")
-            
+            self.logger.error(f"Error handling feedback completion: {str(e)}")
+
+
+     
     def _compute_embedding(self, media_item: Dict) -> torch.Tensor:
         try:
+            
             cache_key = media_item['id']
             with self.embeddings_lock:
                 cached_embedding = self.db.load_embedding(cache_key)
                 if cached_embedding is not None:
-                    return torch.from_numpy(np.frombuffer(cached_embedding, dtype=np.float32)).view(1, -1)
+                    array = np.frombuffer(cached_embedding, dtype=np.float32).copy()
+                    return torch.from_numpy(array).to('cpu').view(1, -1)
 
             
-            text_features = self._encode_text_features(media_item)  
-            numerical_features = self._encode_numerical_features(media_item)  
-            categorical_features = self._encode_categorical_features(media_item)  
-            temporal_features = self._encode_temporal_features(media_item)  
-            metadata_features = self._encode_metadata_features(media_item)  
-            graph_features = self._compute_graph_features(media_item)  
+            text_features = self.text_processor.process_text_features(media_item)
+            
+            
+            numerical_features = self._encode_numerical_features(media_item)
+            categorical_features = self._encode_categorical_features(media_item)
+            temporal_features = self._encode_temporal_features(media_item)
+            metadata_features = self._encode_metadata_features(media_item)
+            graph_features = self._compute_graph_features(media_item)
 
             
-            print(f"text_features shape: {text_features.shape}")
-            print(f"numerical_features shape: {numerical_features.shape}")
-            print(f"categorical_features shape: {categorical_features.shape}")
-            print(f"temporal_features shape: {temporal_features.shape}")
-            print(f"metadata_features shape: {metadata_features.shape}")
-            print(f"graph_features shape: {graph_features.shape}")
+            if hasattr(self.content_encoder, 'debug') and self.content_encoder.debug:
+                print(f"\nFeature shapes:")
+                print(f"text_features: {text_features.shape}")
+                print(f"numerical_features: {numerical_features.shape}")
+                print(f"categorical_features: {categorical_features.shape}")
+                print(f"temporal_features: {temporal_features.shape}")
+                print(f"metadata_features: {metadata_features.shape}")
+                print(f"graph_features: {graph_features.shape}")
 
             
             combined_features = torch.cat([
@@ -3513,11 +4126,10 @@ class RecommendationEngine:
             ], dim=1)
 
             
-            print(f"combined_features shape: {combined_features.shape}")
-
             with torch.no_grad():
                 embedding = self.content_encoder(combined_features)
 
+            
             with self.embeddings_lock:
                 self.db.save_embedding(cache_key, embedding.cpu().numpy().tobytes())
 
@@ -3526,7 +4138,7 @@ class RecommendationEngine:
         except Exception as e:
             self.logger.error(f"Error computing embedding: {str(e)}")
             return torch.zeros((1, 384), device=self.device)
-
+        
     def _extract_subgraph(self, node_id, depth=2):
         subgraph = {
             'nodes': {},
@@ -3558,6 +4170,7 @@ class RecommendationEngine:
 
     def _prepare_graph_data(self, subgraph):
         try:
+            
             node_mapping = {node: idx for idx, node in enumerate(subgraph['nodes'].keys())}
             reverse_mapping = {idx: node for node, idx in node_mapping.items()}
             edge_type_list = list(self.knowledge_graph['edge_types'])
@@ -3590,13 +4203,17 @@ class RecommendationEngine:
                 node_features.append(features)
             
             
-            node_features = torch.cat(node_features, dim=0)
+            if node_features:
+                node_features = torch.cat(node_features, dim=0)
+            else:
+                
+                node_features = torch.zeros((1, 768))
             
             
             return (
-                edge_index.to(self.device).t().contiguous(),
-                edge_type.to(self.device),
-                node_features.to(self.device)
+                edge_index.to('cpu').t().contiguous(),
+                edge_type.to('cpu'),
+                node_features.to('cpu')
             )
             
         except Exception as e:
@@ -3605,7 +4222,7 @@ class RecommendationEngine:
             return (
                 torch.zeros((2, 1), dtype=torch.long, device=self.device),
                 torch.zeros(1, dtype=torch.long, device=self.device),
-                torch.zeros((1, 384), device=self.device)
+                torch.zeros((1, 768), device=self.device)
             )
 
     def _initialize_knowledge_graph(self) -> Dict:
@@ -3699,216 +4316,199 @@ class RecommendationEngine:
             self.logger.error(f"Error resetting model: {str(e)}")
             return f"Error resetting system: {str(e)}"
 
-    def cleanup_similarity_worker(self):
-        try:
-            if hasattr(self, 'similarity_worker'):
-                self.similarity_worker.stop()
-            if hasattr(self, 'similarity_thread') and self.similarity_thread.isRunning():
-                self.similarity_thread.quit()
-                self.similarity_thread.wait()
-        except Exception as e:
-            self.logger.error(f"Error cleaning up similarity worker: {e}")
 
     def cleanup(self):
         try:
-            self.cleanup_similarity_worker()
             
-            with self.embeddings_lock:
-                self.embedding_cache.clear()
+            if hasattr(self, 'feedback_thread') and self.feedback_thread.isRunning():
+                self.feedback_thread.quit()
+                self.feedback_thread.wait(1000)
+        
+            
+            
+            if hasattr(self, 'text_processor'):
+                del self.text_processor
             
             
             models_to_cleanup = [
-                'text_encoder', 'content_encoder', 'genre_encoder',
-                'temporal_encoder', 'metadata_encoder', 'graph_conv',
-                'graph_attention', 'graph_sage'
+                'content_encoder',
+                'genre_encoder',
+                'temporal_encoder',
+                'metadata_encoder',
+                'graph_conv',
+                'graph_attention',
+                'graph_sage'
             ]
             
             for model_name in models_to_cleanup:
                 if hasattr(self, model_name):
+                    model = getattr(self, model_name)
+                    if isinstance(model, torch.nn.Module):
+                        model.cpu()
                     delattr(self, model_name)
             
-            torch.cuda.empty_cache()
+            
+            with self.embeddings_lock:
+                self.embedding_cache.clear()
+            
+            if hasattr(self, 'similarity_matrix'):
+                del self.similarity_matrix
+            
+            if hasattr(self, 'knowledge_graph'):
+                self.knowledge_graph = None
             
         except Exception as e:
             self.logger.error(f"Error during cleanup: {str(e)}")
 
-    def _safe_text_conversion(self, value) -> str:
-        if value is None:
-            return ""
-        if isinstance(value, str):
-            return value
-        if isinstance(value, (list, dict)):
-            try:
-                if isinstance(value, list):
-                    return " ".join(
-                        str(item.get('name', item.get('content', item))) 
-                        if isinstance(item, dict) 
-                        else str(item) 
-                        for item in value
-                    )
-                else:
-                    return str(value.get('name', value.get('content', str(value))))
-            except Exception:
-                return str(value)
-        return str(value)
-
+            
     def _encode_text_features(self, item: Dict) -> torch.Tensor:
-        try:
-            text_fields = []
-            
 
-            fields_to_process = [
-                item.get('title', ''),
-                item.get('summary', ''),
-                item.get('overview', ''),
-                item.get('tagline', ''),
-                self._process_json_field(item.get('keywords', '[]')),
-                self._process_json_field(item.get('reviews', '[]'))
-            ]
+        try:
             
-            text_fields = [self._safe_text_conversion(field) for field in fields_to_process]
-            
-            combined_text = ' [SEP] '.join(filter(None, text_fields))
-            
-            if not combined_text.strip():
-                combined_text = "unknown content"
-            
-            with torch.no_grad():
-                inputs = self.tokenizer(
-                    combined_text,
-                    return_tensors='pt',
-                    truncation=True,
-                    max_length=512,
-                    padding=True
-                ).to(self.device)
-                
-                outputs = self.text_encoder(**inputs)
-                text_embedding = outputs.last_hidden_state.mean(dim=1)
-                
-            return text_embedding
-            
+            return self.text_processor.process_text_features(item)
         except Exception as e:
             self.logger.error(f"Error in text encoding: {str(e)}")
+            
             return torch.zeros((1, 384), device=self.device)
             
     def _encode_numerical_features(self, item: Dict) -> torch.Tensor:
-        features = [
-            float(item.get('popularity', 0)),
-            float(item.get('vote_average', 0)) / 10.0,
-            float(item.get('vote_count', 0)) / 10000.0,
-            float(item.get('year', 2000)) / 2025.0,
-        ]
-        
-        numerical_features = torch.tensor(
-            features, 
-            device=self.device,
-            dtype=torch.float32
-        ).unsqueeze(0)  
-        
-        return numerical_features
+
+        try:
+            
+            features = [
+                float(item.get('popularity', 0)) / 100.0,  
+                float(item.get('vote_average', 0)) / 10.0,  
+                float(item.get('vote_count', 0)) / 10000.0,  
+                float(item.get('year', 2000)) / 2025.0,  
+            ]
+            
+            
+            numerical_features = torch.tensor(
+                features,
+                device=self.device,
+                dtype=torch.float32
+            ).unsqueeze(0)  
+            
+            return numerical_features
+            
+        except Exception as e:
+            self.logger.error(f"Error encoding numerical features: {str(e)}")
+            return torch.zeros((1, 4), device=self.device)
 
     def _encode_categorical_features(self, item: Dict) -> torch.Tensor:
-        
-        genres = self._process_json_field(item.get('genres', '[]'))
-        genre_encoding = self._one_hot_genres(genres)  
-        
-        
-        status_encoding = torch.tensor(
-            self._one_hot_encode(
-                item.get('status', ''),
-                ['Released', 'In Production', 'Ended', 'Cancelled']  
-            ),
-            device=self.device,
-            dtype=torch.float32
-        )  
-        
-        type_encoding = torch.tensor(
-            self._one_hot_encode(
-                item.get('type', ''),
-                ['movie', 'show']  
-            ),
-            device=self.device,
-            dtype=torch.float32
-        )  
-        
-        language_encoding = torch.tensor(
-            self._one_hot_encode(
-                item.get('language', ''),
-                ['en', 'es', 'fr', 'de', 'ja', 'ko', 'zh']  
-            ),
-            device=self.device,
-            dtype=torch.float32
-        )  
-        
-        
-        
-        combined_categorical = torch.cat([
-            genre_encoding,
-            status_encoding,
-            type_encoding,
-            language_encoding
-        ])
-        
-        
-        combined_categorical = combined_categorical.unsqueeze(0)
-        
-        
-        categorical_embedding = self.genre_encoder(combined_categorical)  
-        
-        return categorical_embedding
+
+        try:
+            
+            genres = self._process_json_field(item.get('genres', '[]'))
+            genre_encoding = self._one_hot_genres(genres)
+            
+            
+            status_encoding = torch.tensor(
+                self._one_hot_encode(
+                    item.get('status', ''),
+                    ['Released', 'In Production', 'Ended', 'Cancelled']
+                ),
+                device=self.device,
+                dtype=torch.float32
+            )
+            
+            
+            type_encoding = torch.tensor(
+                self._one_hot_encode(
+                    item.get('type', ''),
+                    ['movie', 'show']
+                ),
+                device=self.device,
+                dtype=torch.float32
+            )
+            
+            
+            language_encoding = torch.tensor(
+                self._one_hot_encode(
+                    item.get('language', ''),
+                    ['en', 'es', 'fr', 'de', 'ja', 'ko', 'zh']
+                ),
+                device=self.device,
+                dtype=torch.float32
+            )
+            
+            
+            categorical_features = torch.cat([
+                genre_encoding,
+                status_encoding,
+                type_encoding,
+                language_encoding
+            ])
+            
+            
+            categorical_features = categorical_features.unsqueeze(0)
+            
+            
+            encoded_categorical = self.genre_encoder(categorical_features)
+            
+            return encoded_categorical
+            
+        except Exception as e:
+            self.logger.error(f"Error encoding categorical features: {str(e)}")
+            return torch.zeros((1, 256), device=self.device)  
 
     def _encode_temporal_features(self, item: Dict) -> torch.Tensor:
-        temporal_features = torch.zeros(32, device=self.device)
-        
-        
-        year = int(item.get('year', datetime.now().year))
-        current_year = datetime.now().year
-        years_old = (current_year - year) / 100.0
-        temporal_features[0] = years_old
-        
-        
-        release_date = item.get('release_date', '')
-        if release_date:
-            try:
-                release_month = datetime.strptime(release_date, '%Y-%m-%d').month
-                temporal_features[release_month] = 1.0
-            except ValueError:
-                pass
-        
-        
-        temporal_features = temporal_features.unsqueeze(0)  
-        encoded_temporal = self.temporal_encoder(temporal_features)  
-        
-        return encoded_temporal
-
-    def _encode_metadata_features(self, item: Dict) -> torch.Tensor:
-        metadata_fields = [
-            self._process_json_field(item.get('production_companies', '[]')),
-            self._process_json_field(item.get('credits', '[]')),
-            self._process_json_field(item.get('keywords', '[]'))
-        ]
-        
-        metadata_text = ' '.join(filter(None, metadata_fields))
-        
-        with torch.no_grad():
-            inputs = self.tokenizer(
-                metadata_text,
-                return_tensors='pt',
-                truncation=True,
-                max_length=256,
-                padding=True
-            ).to(self.device)
+        try:
+            temporal_features = torch.zeros(32, device=self.device)
             
-            outputs = self.text_encoder(**inputs)
-            metadata_embedding = outputs.last_hidden_state.mean(dim=1)  
+            
+            year = int(item.get('year', datetime.now().year))
+            current_year = datetime.now().year
+            years_old = (current_year - year) / 100.0  
+            temporal_features[0] = years_old
+            
+            
+            release_date = item.get('release_date', '')
+            if release_date:
+                try:
+                    release_month = datetime.strptime(release_date, '%Y-%m-%d').month
+                    temporal_features[release_month] = 1.0
+                except ValueError:
+                    pass
+            
+            
+            temporal_features = temporal_features.unsqueeze(0)
+            
+            
+            encoded_temporal = self.temporal_encoder(temporal_features)
+            
+            return encoded_temporal
+            
+        except Exception as e:
+            self.logger.error(f"Error encoding temporal features: {str(e)}")
+            return torch.zeros((1, 256), device=self.device)  
         
-        
-        encoded_metadata = self.metadata_encoder(metadata_embedding)  
-        
-        return encoded_metadata
+    def _encode_metadata_features(self, item: Dict) -> torch.Tensor:
+        try:
+            
+            metadata_fields = [
+                self._process_json_field(item.get('production_companies', '[]')),
+                self._process_json_field(item.get('credits', '[]')),
+                self._process_json_field(item.get('keywords', '[]'))
+            ]
+            
+            
+            metadata_text = ' '.join(filter(None, metadata_fields))
+            
+            
+            metadata_embedding = self.text_processor.encode_text(metadata_text)
+            
+            
+            encoded_metadata = self.metadata_encoder(metadata_embedding)
+            
+            return encoded_metadata
+            
+        except Exception as e:
+            self.logger.error(f"Error encoding metadata features: {str(e)}")
+            return torch.zeros((1, 256), device=self.device)  
 
-    def _process_json_field(self, field):
-        return self.json_utils.process_json_field(field)
+    def _process_json_field(self, field: Any) -> str:
+        return JSONUtils.process_json_field(field)
 
 
     def _one_hot_genres(self, genres_str: Union[str, List]) -> torch.Tensor:
@@ -3945,73 +4545,50 @@ class RecommendationEngine:
 
     def _update_knowledge_graph(self, media_id: int, rating: float, content_data: Dict) -> None:
         try:
+            node_id = f"media_{media_id}"
+            print(f"Updating knowledge graph for {content_data.get('title', 'Unknown')}")
+            
+            
             with self.graph_lock:
-                node_id = f"media_{media_id}"
-                print(f"Updating knowledge graph for {content_data.get('title', 'Unknown')}")
-                
                 if node_id not in self.knowledge_graph['nodes']:
                     self.knowledge_graph['nodes'][node_id] = {
                         'type': 'media',
                         'data': {
                             k: v for k, v in content_data.items() 
-                            if not isinstance(v, torch.Tensor)  
+                            if not isinstance(v, torch.Tensor)
                         },
                         'rating': float(rating)
                     }
                 else:
                     self.knowledge_graph['nodes'][node_id]['rating'] = float(rating)
                     
-                print(f"Updated node: {node_id}")
+            
+            if hasattr(self, 'edge_updater') and self.edge_updater.isRunning():
+                self.edge_updater.stop()
+                self.edge_updater.wait()
                 
-                try:
-                    similar_items = self._find_similar_items(content_data)
-                    print(f"Found {len(similar_items)} similar items")
-                    
-                    for similar_id in similar_items:
-                        similar_node_id = f"media_{similar_id}"
-                        edge_tuple = (similar_node_id, 'similar_to')
-                        
-                        self.knowledge_graph['edges'].setdefault(similar_node_id, [])
-                        self.knowledge_graph['edges'].setdefault(node_id, [])
-                            
-                        if edge_tuple not in self.knowledge_graph['edges'][node_id]:
-                            self.knowledge_graph['edges'][node_id].append(edge_tuple)
-                            self.knowledge_graph['edge_types'].add('similar_to')
-                            print(f"Added edge: {node_id} -> {similar_node_id}")
-                            
-                except Exception as e:
-                    print(f"Error processing similar items: {e}")
+            self.edge_updater = GraphEdgeUpdater(self, node_id, content_data)
+            
+            
+            self.edge_updater.progress.connect(
+                lambda msg: print(f"Edge update progress: {msg}")
+            )
+            self.edge_updater.error.connect(
+                lambda err: self.logger.error(f"Edge update error: {err}")
+            )
+            self.edge_updater.finished.connect(
+                lambda: print(f"Edge update completed for {node_id}")
+            )
+            
+            
+            self.edge_updater.start()
                 
         except Exception as e:
             self.logger.error(f"Error updating knowledge graph: {str(e)}")
             print(f"Error in knowledge graph update: {e}")
             print(f"Traceback: {traceback.format_exc()}")
-            
-    def _find_similar_items(self, content_data: Dict) -> List[int]:
-        try:
-            cursor = self.db.conn.cursor()
-            item_id = content_data['id']
-            
-            similar_items = self._get_cached_similarities(item_id)
-            if similar_items:
-                return similar_items
+                    
 
-            targeted_items = self._get_targeted_candidates(content_data)
-            print(f"Computing similarities for {len(targeted_items)} targeted candidates...")
-
-            content_data = self._sanitize_json_fields(content_data)
-            
-            similarities = self._compute_similarities_for_batch(content_data, targeted_items)
-            
-            self._store_similarities(item_id, similarities)
-            
-            similar_ids = [item_id for item_id, _, _ in similarities[:20]]
-            return similar_ids
-
-        except Exception as e:
-            self.logger.error(f"Error finding similar items: {str(e)}")
-            return []
-    
     def _sanitize_json_fields(self, data: Dict) -> Dict:
         sanitized = data.copy()
         
@@ -4033,21 +4610,6 @@ class RecommendationEngine:
                 
         return sanitized
             
-    def _get_cached_similarities(self, item_id: int) -> Optional[List[int]]:
-        cursor = self.db.conn.cursor()
-        cursor.execute('''
-            SELECT item2_id, similarity 
-            FROM similarity_matrix 
-            WHERE item1_id = ? 
-            AND last_updated > datetime('now', '-24 hours')
-            ORDER BY similarity DESC
-            LIMIT 20
-        ''', (item_id,))
-        results = cursor.fetchall()
-        
-        if results:
-            return [r[0] for r in results]
-        return None
 
     def _get_targeted_candidates(self, content_data: Dict) -> List[Dict]:
         cursor = self.db.conn.cursor()
@@ -4109,137 +4671,6 @@ class RecommendationEngine:
         except Exception:
             return set()
 
-    def _compute_similarities_for_batch(self, reference_item: Dict, candidates: List[Dict]) -> List[Tuple[int, str, float]]:
-        similarities = []
-        batch_size = 5
-        
-        try:
-            reference_embedding = self._compute_embedding(reference_item)
-            reference_embedding = reference_embedding.view(-1)
-            reference_embedding = F.normalize(reference_embedding, p=2, dim=0)
-            
-            ref_genres = self._safe_extract_list(reference_item.get('genres'))
-            ref_keywords = self._safe_extract_list(reference_item.get('keywords'))
-            ref_networks = self._safe_extract_list(reference_item.get('network'))
-            ref_production = self._safe_extract_list(reference_item.get('production_companies'))
-            
-            ref_year = self._safe_float(reference_item.get('year', 0))
-            ref_runtime = self._safe_float(reference_item.get('runtime', 0))
-            ref_language = str(reference_item.get('language', ''))
-            ref_status = str(reference_item.get('status', ''))
-            
-            ref_cast_ids = set()
-            ref_director_ids = set()
-            ref_writer_ids = set()
-            
-            try:
-                credits = self._safe_extract_list(reference_item.get('credits'))
-                if isinstance(credits, dict):
-                    cast = credits.get('cast', [])
-                    crew = credits.get('crew', [])
-                    
-                    if isinstance(cast, list):
-                        ref_cast_ids = {str(c.get('id', '')) for c in cast[:10] if isinstance(c, dict)}
-                    
-                    if isinstance(crew, list):
-                        ref_director_ids = {str(c.get('id', '')) for c in crew if isinstance(c, dict) and c.get('job') == 'Director'}
-                        ref_writer_ids = {str(c.get('id', '')) for c in crew if isinstance(c, dict) and c.get('job') in ['Writer', 'Screenplay']}
-            except Exception as e:
-                self.logger.error(f"Error processing reference credits: {e}")
-            
-            for i in range(0, len(candidates), batch_size):
-                batch = candidates[i:i + batch_size]
-                batch_similarities = []
-                
-                for item in batch:
-                    try:
-                        with torch.no_grad():
-                            other_embedding = self._compute_embedding(item)
-                            other_embedding = other_embedding.view(-1)
-                            other_embedding = F.normalize(other_embedding, p=2, dim=0)
-                            embedding_similarity = torch.dot(reference_embedding, other_embedding).item()
-                        
-                        item_genres = self._safe_extract_list(item.get('genres'))
-                        item_keywords = self._safe_extract_list(item.get('keywords'))
-                        item_networks = self._safe_extract_list(item.get('network'))
-                        item_production = self._safe_extract_list(item.get('production_companies'))
-                        
-                        item_cast_ids = set()
-                        item_director_ids = set()
-                        item_writer_ids = set()
-                        
-                        try:
-                            credits = self._safe_extract_list(item.get('credits'))
-                            if isinstance(credits, dict):
-                                cast = credits.get('cast', [])
-                                crew = credits.get('crew', [])
-                                
-                                if isinstance(cast, list):
-                                    item_cast_ids = {str(c.get('id', '')) for c in cast[:10] if isinstance(c, dict)}
-                                
-                                if isinstance(crew, list):
-                                    item_director_ids = {str(c.get('id', '')) for c in crew if isinstance(c, dict) and c.get('job') == 'Director'}
-                                    item_writer_ids = {str(c.get('id', '')) for c in crew if isinstance(c, dict) and c.get('job') in ['Writer', 'Screenplay']}
-                        except Exception as e:
-                            self.logger.error(f"Error processing candidate credits: {e}")
-                        
-                        genre_similarity = self._safe_set_similarity(ref_genres, item_genres)
-                        year_similarity = max(0, 1 - abs(ref_year - self._safe_float(item.get('year', 0))) / 100)
-                        runtime_similarity = max(0, 1 - abs(ref_runtime - self._safe_float(item.get('runtime', 0))) / 120)
-                        keyword_similarity = self._safe_set_similarity(ref_keywords, item_keywords)
-                        cast_similarity = self._safe_set_similarity(ref_cast_ids, item_cast_ids)
-                        director_similarity = self._safe_set_similarity(ref_director_ids, item_director_ids)
-                        writer_similarity = self._safe_set_similarity(ref_writer_ids, item_writer_ids)
-                        production_similarity = self._safe_set_similarity(ref_production, item_production)
-                        network_similarity = self._safe_set_similarity(ref_networks, item_networks)
-                        
-                        language_match = 1.0 if ref_language == str(item.get('language', '')) else 0.0
-                        status_match = 1.0 if ref_status == str(item.get('status', '')) else 0.0
-                        
-                        popularity_score = min(1.0, self._safe_float(item.get('popularity', 0)) / 100.0)
-                        vote_average = self._safe_float(item.get('vote_average', 0)) / 10.0
-                        vote_count = min(1.0, self._safe_float(item.get('vote_count', 0)) / 1000.0)
-                        
-                        final_similarity = (
-                            0.25 * embedding_similarity +
-                            0.15 * genre_similarity +
-                            0.10 * keyword_similarity +
-                            0.10 * cast_similarity +
-                            0.08 * director_similarity +
-                            0.05 * writer_similarity +
-                            0.05 * production_similarity +
-                            0.05 * year_similarity +
-                            0.03 * runtime_similarity +
-                            0.03 * network_similarity +
-                            0.03 * language_match +
-                            0.02 * status_match +
-                            0.04 * vote_average +
-                            0.02 * vote_count +
-                            0.02 * popularity_score
-                        )
-                        
-                        batch_similarities.append((item['id'], item['title'], final_similarity))
-                        
-                    except Exception as e:
-                        self.logger.error(f"Error processing comparison item {item.get('id')}: {e}")
-                        continue
-                    finally:
-                        if 'other_embedding' in locals():
-                            del other_embedding
-                        torch.cuda.empty_cache()
-                
-                similarities.extend(batch_similarities)
-                
-            return sorted(similarities, key=lambda x: x[2], reverse=True)
-            
-        except Exception as e:
-            self.logger.error(f"Error computing similarities: {str(e)}")
-            return []
-        finally:
-            if 'reference_embedding' in locals():
-                del reference_embedding
-            torch.cuda.empty_cache()
-
     def _safe_extract_list(self, value: Any) -> Set[str]:
         try:
             if not value:
@@ -4270,48 +4701,6 @@ class RecommendationEngine:
             
         except Exception as e:
             self.logger.error(f"Error in safe_extract_list: {e}")
-            return set()
-
-    def _safe_float(self, value: Any) -> float:
-        try:
-            if isinstance(value, (int, float)):
-                return float(value)
-            if isinstance(value, str) and value.strip():
-                return float(value)
-            return 0.0
-        except (ValueError, TypeError):
-            return 0.0
-
-    def _safe_set_similarity(self, set1: Set[str], set2: Set[str]) -> float:
-        try:
-            if not set1 or not set2:
-                return 0.0
-            union_size = len(set1 | set2)
-            if union_size == 0:
-                return 0.0
-            return len(set1 & set2) / union_size
-        except Exception:
-            return 0.0
-    
-    def _extract_names_from_json(self, json_str: str) -> Set[str]:
-        try:
-            if not json_str:
-                return set()
-            
-            data = self._parse_json_field(json_str)
-            if not data:
-                return set()
-            
-            if isinstance(data, list):
-                return {
-                    str(item.get('name', item)) if isinstance(item, dict) else str(item)
-                    for item in data
-                    if item is not None
-                }
-            
-            return {str(data)}
-        except Exception as e:
-            self.logger.error(f"Error extracting names: {str(e)}")
             return set()
 
     def _parse_json_field(self, field: Union[str, Dict, List]) -> Union[Dict, List]:
@@ -4349,70 +4738,36 @@ class RecommendationEngine:
                 item_data = dict(zip(columns, cursor.fetchone()))
                 
                 
-                text = f"{item_data.get('title', '')} {item_data.get('summary', '')}"
-                inputs = self.tokenizer(
-                    text,
-                    return_tensors='pt',
-                    truncation=True,
-                    max_length=128,
-                    padding=True
-                )
+                text_fields = [
+                    item_data.get('title', ''),
+                    item_data.get('summary', ''),
+                    item_data.get('overview', ''),
+                    item_data.get('tagline', '')
+                ]
+                text = ' [SEP] '.join(filter(None, text_fields))
                 
                 
-                with torch.no_grad():
-                    outputs = self.text_encoder(**{k: v for k, v in inputs.items()})
-                    features = outputs.last_hidden_state.mean(dim=1)
+                features = self.text_processor.encode_text(text)
+                
+                
+                if len(features.shape) == 1:
+                    features = features.unsqueeze(0)
+                
+                return features.cpu()
             else:
                 
                 node_hash = hash(str(node_data))
                 torch.manual_seed(node_hash)
-                features = torch.randn(1, 384)
-            
-            return features.cpu()  
-            
+                
+                features = torch.randn(1, 768)
+                return features.cpu()
+                
         except Exception as e:
             self.logger.error(f"Error getting node features: {str(e)}")
-            return torch.zeros((1, 384))
+            
+            return torch.zeros((1, 768))
 
-    def _store_similarities(self, item_id: int, similarities: List[Tuple], is_final: bool = True):
-        if not similarities:
-            self.logger.debug(f"No similarities to store for item {item_id}")
-            return
-                
-        try:
-            with self.db.write_lock:
-                cursor = self.db.conn.cursor()
-                
-                if is_final:
-                    cursor.execute(
-                        'DELETE FROM similarity_matrix WHERE item1_id = ?', 
-                        (item_id,)
-                    )
-
-                valid_similarities = []
-                for sim in similarities:
-                    try:
-                        if len(sim) >= 3 and all(s is not None for s in (sim[0], sim[2])):
-                            valid_similarities.append((item_id, sim[0], sim[2]))
-                    except (IndexError, TypeError) as e:
-                        self.logger.error(f"Invalid similarity data: {sim}, Error: {str(e)}")
-                        continue
-                
-                if valid_similarities:
-                    cursor.executemany('''
-                        INSERT OR REPLACE INTO similarity_matrix 
-                        (item1_id, item2_id, similarity, last_updated)
-                        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-                    ''', valid_similarities)
-                
-                self.db.conn.commit()
-                
-        except Exception as e:
-            self.logger.error(f"Error storing similarities: {str(e)}")
-        finally:
-            if cursor:
-                cursor.close()
-                    
+                         
     def _compute_graph_features(self, item):
         try:
             with self.graph_lock:
@@ -4455,7 +4810,7 @@ class RecommendationEngine:
                     combined_embedding = torch.cat(features, dim=1)
                     
                     
-                    return combined_embedding.to(self.device)
+                    return combined_embedding.to('cpu')
 
         except Exception as e:
             self.logger.error(f"Error computing graph features: {str(e)}")
@@ -4468,7 +4823,7 @@ class RecommendationEngine:
             if 'graph_embedding' in locals(): del graph_embedding
             if 'attention_embedding' in locals(): del attention_embedding
             if 'sage_embedding' in locals(): del sage_embedding
-            torch.cuda.empty_cache()
+
 
 class PosterDownloader(QObject):
     def __init__(self):
@@ -4631,13 +4986,13 @@ class BackgroundTrainer(QThread):
         self.min_wait_time = 300
         self.max_wait_time = 3600
         self.batch_size = 32
+        
         self.preference_lock = threading.RLock()
         self._batch_lock = threading.Lock()
         self._embedding_lock = threading.Lock()
-        self._training_queue = deque(maxlen=1000)
         self._queue_lock = threading.Lock()
-        self.logger = logging.getLogger(__name__)
-        self.json_utils = JSONUtils()
+        
+        self._training_queue = deque(maxlen=1000)
             
     def run(self):
         while not self._stop_flag.is_set():
@@ -4674,25 +5029,27 @@ class BackgroundTrainer(QThread):
                 self._training_queue.append(item_data)
                 
     def _run_training_cycle(self):
-        self.training_status.emit("Starting background training cycle")
-        
-        with self._batch_lock:
-            self._update_missing_embeddings()
-        
-        with self._batch_lock:
-            self._refresh_old_embeddings()
-            
-        with self._embedding_lock:
-            self._update_similarity_matrix()
-            
-        with self._batch_lock:
-            self._train_on_feedback()
-            
-        with self.preference_lock:
-            self._update_genre_preferences_from_feedback()
-            
-        self._process_training_queue()
-        
+        try:
+            if self.recommender.is_processing_feedback():
+                self.training_status.emit("Waiting for feedback processing to complete")
+                return
+
+            if not self.recommender.training_lock.acquire(timeout=1):
+                self.training_status.emit("Training locked, skipping cycle")
+                return
+
+            try:
+                self.training_status.emit("Starting background training cycle")
+            finally:
+                try:
+                    self.recommender.training_lock.release()
+                except RuntimeError:
+                    pass
+
+        except Exception as e:
+            self.logger.error(f"Error in training cycle: {str(e)}")
+            self.training_status.emit(f"Training error: {str(e)}")
+
     def _process_training_queue(self):
         while True:
             with self._queue_lock:
@@ -4719,11 +5076,7 @@ class BackgroundTrainer(QThread):
             for genres, rating in cursor.fetchall():
                 if genres and rating:
                     try:
-                        if isinstance(genres, str):
-                            genres_list = json.loads(genres)
-                        else:
-                            genres_list = genres
-                        
+                        genres_list = JSONUtils.process_json_field(genres)
                         if isinstance(genres_list, list):
                             with self.preference_lock:
                                 for genre in genres_list:
@@ -4738,8 +5091,6 @@ class BackgroundTrainer(QThread):
                                         ''', (genre_name, float(rating), float(rating)))
                                 self.db.conn.commit()
                                 
-                    except json.JSONDecodeError:
-                        continue
                     except Exception as e:
                         self.logger.error(f"Error processing genre preferences: {str(e)}")
                         continue
@@ -4757,7 +5108,6 @@ class BackgroundTrainer(QThread):
                 finally:
                     if embedding is not None:
                         del embedding
-                        torch.cuda.empty_cache()
                     
             with self.preference_lock:
                 self._update_item_preferences(item_data)
@@ -4834,25 +5184,21 @@ class BackgroundTrainer(QThread):
             
             update_ratio = recent_updates / max(total_items, 1)
             
-            if update_ratio > 0.2: 
+            if update_ratio > 0.2:
                 sleep_time = self.min_wait_time
-            elif update_ratio > 0.1:  
+            elif update_ratio > 0.1:
                 sleep_time = (self.min_wait_time + self.max_wait_time) / 2
-            else: 
+            else:
                 sleep_time = self.max_wait_time
                 
             return max(self.min_wait_time, min(sleep_time, self.max_wait_time))
             
         except Exception as e:
             self.logger.error(f"Error calculating sleep time: {e}")
-            return self.max_wait_time 
+            return self.max_wait_time
         finally:
             if cursor:
                 cursor.close()
-
-    def _update_similarity_matrix(self):
-        self.training_status.emit("Updating similarity matrix")
-        self.recommender._update_similarity_matrix()
 
     def _train_on_feedback(self):
         cursor = self.db.conn.cursor()
@@ -4880,31 +5226,34 @@ class BackgroundTrainer(QThread):
                     self.logger.error(f"Error training batch: {str(e)}")
                     continue
 
-    def _process_json_field(self, field):
-        return self.json_utils.process_json_field(field)
-
     def _update_item_preferences(self, item_data):
         if not isinstance(item_data, dict):
             return
                 
         try:
-            genres = self.json_utils.process_json_field(item_data.get('genres', '[]'))
+            genres = JSONUtils.process_json_field(item_data.get('genres', '[]'))
             if genres:
-                genres_list = self.json_utils.extract_list(genres)
+                genres_list = JSONUtils.extract_list(genres)
                 if genres_list:
                     with self.preference_lock:
                         cursor = self.db.conn.cursor()
                         for genre_name in genres_list:
                             if genre_name:
+                                vote_average = item_data.get('vote_average', 5.0)
+                                if isinstance(vote_average, list):
+                                    vote_average = 5.0
+                                try:
+                                    vote_average = float(vote_average)
+                                except (TypeError, ValueError):
+                                    vote_average = 5.0
+                                    
                                 cursor.execute('''
                                     INSERT INTO genre_preferences (genre, rating_sum, rating_count)
                                     VALUES (?, ?, 1)
                                     ON CONFLICT(genre) DO UPDATE SET
                                         rating_sum = rating_sum + ?,
                                         rating_count = rating_count + 1
-                                ''', (genre_name, 
-                                     float(item_data.get('vote_average', 5.0)), 
-                                     float(item_data.get('vote_average', 5.0))))
+                                ''', (genre_name, vote_average, vote_average))
                         self.db.conn.commit()
                     
         except Exception as e:
@@ -4920,83 +5269,6 @@ class BackgroundTrainer(QThread):
         if self.isRunning():
             self.terminate()
             self.wait(1000)
-
-class SimilarityComputationThread(QThread):
-    progress = Signal(str)
-    finished = Signal()
-
-    def __init__(self, engine, reference_item, candidates):
-        super().__init__()
-        self.engine = engine
-        self.reference_item = reference_item
-        self.candidates = candidates
-        self._stop_flag = False
-
-    def run(self):
-        reference_embedding = None
-        reference_cpu = None
-        try:
-            similarities = []
-            batch_size = 5
-
-            with torch.no_grad():
-                reference_embedding = self.engine._compute_embedding(self.reference_item)
-                reference_embedding = reference_embedding.view(-1)
-                reference_embedding = F.normalize(reference_embedding, p=2, dim=0)
-                reference_cpu = reference_embedding.cpu()
-
-            for i in range(0, len(self.candidates), batch_size):
-                if self._stop_flag:
-                    break
-
-                batch = self.candidates[i:i + batch_size]
-                batch_similarities = []
-
-                for item in batch:
-                    if self._stop_flag:
-                        break
-
-                    other_embedding = None
-                    other_cpu = None
-                    try:
-                        with torch.no_grad():
-                            other_embedding = self.engine._compute_embedding(item)
-                            other_embedding = other_embedding.view(-1)
-                            other_embedding = F.normalize(other_embedding, p=2, dim=0)
-                            other_cpu = other_embedding.cpu()
-
-                            similarity = torch.dot(reference_cpu, other_cpu).item()
-                            batch_similarities.append((item['id'], item['title'], similarity))
-
-                    except Exception as e:
-                        self.engine.logger.error(f"Error processing item {item['id']}: {e}")
-                        continue
-                    finally:
-                        if other_embedding is not None:
-                            del other_embedding
-                        if other_cpu is not None:
-                            del other_cpu
-                        torch.cuda.empty_cache()
-
-                similarities.extend(batch_similarities)
-                progress = f"Computing similarities: {min(i + batch_size, len(self.candidates))}/{len(self.candidates)}"
-                self.progress.emit(progress)
-
-            if not self._stop_flag:
-                self.engine._store_similarities(self.reference_item['id'], similarities)
-
-        except Exception as e:
-            self.engine.logger.error(f"Error in similarity computation: {str(e)}")
-        finally:
-            if reference_embedding is not None:
-                del reference_embedding
-            if reference_cpu is not None:
-                del reference_cpu
-            torch.cuda.empty_cache()
-            self.finished.emit()
-            
-    def stop(self):
-        self._stop_flag = True
 
 class MediaScanner:
     def __init__(self):
