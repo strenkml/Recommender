@@ -276,4 +276,4 @@ similarity_matrix:
 - Data consistency checks
 
 ## License
-MIT License - See [LICENSE](LICENSE) file for details
+GPL v3 - See [LICENSE](LICENSE) file for details
