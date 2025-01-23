@@ -1,0 +1,18 @@
+services:
+  recommender:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: recommender
+    restart: unless-stopped
+    ports:
+      # Host:Container
+      - 3000:3000
+    volumes:
+      # Host:Container
+      - ./data:/app/data
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/New_York
+    
