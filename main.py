@@ -36,10 +36,10 @@ from PySide6.QtWidgets import (
     QDialogButtonBox, QButtonGroup, QToolButton
 )
 from PySide6.QtCore import (
-    Qt, QTimer, QThread, Signal, QUrl, QObject, QEventLoop, QSize, QMutex
+    Qt, QTimer, QThread, Signal, QUrl, QObject, QEventLoop, QSize, QMutex, QRegularExpression
 )
 from PySide6.QtGui import (
-    QPalette, QColor, QPixmap, QPainter, QFont, QIcon, QCloseEvent
+    QPalette, QColor, QPixmap, QPainter, QFont, QIcon, QCloseEvent, QRegularExpressionValidator
 )
 from PySide6.QtNetwork import (
     QNetworkAccessManager, QNetworkRequest, QNetworkReply
@@ -1709,6 +1709,13 @@ class MediaRecommenderApp(QMainWindow):
         
         self.collection_name = QLineEdit("AI Recommended")
         plex_layout.addRow("Collection To Add Movies To:", self.collection_name)
+        self.auto_collect_threshold = QLineEdit()
+        self.auto_collect_threshold.setPlaceholderText("Leave empty to disable")
+        self.auto_collect_threshold.setToolTip("Automatically add items to collection if rated at or above this value (1-10)")
+        validator = QRegularExpressionValidator()
+        validator.setRegularExpression(QRegularExpression("^([1-9]|10)$"))
+        self.auto_collect_threshold.setValidator(validator)
+        plex_layout.addRow("Auto-add to Collection if Rating >=:", self.auto_collect_threshold)
 
         plex_group.setLayout(plex_layout)
         layout.addWidget(plex_group)
@@ -1775,6 +1782,27 @@ class MediaRecommenderApp(QMainWindow):
         config_widget.setLayout(layout)
         self.tabs.addTab(config_widget, "Configuration")                   
 
+
+    def load_plex_libraries(self):
+        try:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+           
+            self.library_list.clear()
+           
+            plex = PlexServer(self.plex_url.text(), self.plex_token.text())
+           
+            for library in plex.library.sections():
+                if library.type in ['movie', 'show']:
+                    item = QListWidgetItem(f"{library.title} ({library.type})")
+                    self.library_list.addItem(item)
+                   
+            QMessageBox.information(self, "Success", "Libraries loaded successfully!")
+           
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load libraries: {str(e)}")
+        finally:
+            QApplication.restoreOverrideCursor()
+
     def show_rating_dialog(self, rating_type, media_type):
         dialog = QDialog(self)
         dialog.setWindowTitle(f"Rate how much you {'liked' if rating_type == 'like' else 'disliked'} it")
@@ -1826,12 +1854,26 @@ class MediaRecommenderApp(QMainWindow):
                 if row:
                     columns = [description[0] for description in cursor.description]
                     content_data = dict(zip(columns, row))
-                    
-                    
+
                     if self.current_items[media_type] is not None:
                         self.item_history[media_type].append(self.current_items[media_type])
                         
                     self.recommender.train_with_feedback(current_id, rating, content_data)
+
+                    threshold_text = self.auto_collect_threshold.text().strip()
+                    if (threshold_text and 
+                        media_type == 'movie' and
+                        rating >= float(threshold_text)):
+                        try:
+                            self.add_to_collection(media_type)
+                        except Exception as e:
+                            self.logger.error(f"Auto-collection failed: {e}")
+                            QMessageBox.warning(
+                                self,
+                                "Auto-Collection Failed",
+                                f"Failed to automatically add to collection: {str(e)}"
+                            )
+
                     self.show_next_recommendation(media_type)
                         
         except Exception as e:
@@ -1840,6 +1882,7 @@ class MediaRecommenderApp(QMainWindow):
                 
         finally:
             self._rating_mutex.unlock()
+
 
      
     def load_config(self):
@@ -2309,33 +2352,14 @@ class MediaRecommenderApp(QMainWindow):
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to reset system: {str(e)}")
 
-    def load_plex_libraries(self):
-        try:
-            QApplication.setOverrideCursor(Qt.WaitCursor)
-           
-            self.library_list.clear()
-           
-            plex = PlexServer(self.plex_url.text(), self.plex_token.text())
-           
-            for library in plex.library.sections():
-                if library.type in ['movie', 'show']:
-                    item = QListWidgetItem(f"{library.title} ({library.type})")
-                    self.library_list.addItem(item)
-                   
-            QMessageBox.information(self, "Success", "Libraries loaded successfully!")
-           
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to load libraries: {str(e)}")
-        finally:
-            QApplication.restoreOverrideCursor()
-           
     def save_config(self):
         config = {
             'plex_url': self.plex_url.text().strip(),
             'plex_token': self.plex_token.text().strip(),
             'tvdb_key': self.tvdb_key.text().strip(),
             'tmdb_key': self.tmdb_key.text().strip(),
-            'collection_name': self.collection_name.text().strip()
+            'collection_name': self.collection_name.text().strip(),
+            'auto_collect_threshold': self.auto_collect_threshold.text().strip()
         }
 
         try:
@@ -2346,6 +2370,27 @@ class MediaRecommenderApp(QMainWindow):
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save configuration: {str(e)}")
+
+    def load_config(self):
+        config_path = 'config.json'
+        try:
+            if os.path.exists(config_path):
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+                    self.plex_url.setText(config.get('plex_url', ''))
+                    self.plex_token.setText(config.get('plex_token', ''))
+                    self.tvdb_key.setText(config.get('tvdb_key', ''))
+                    self.tmdb_key.setText(config.get('tmdb_key', ''))
+                    self.collection_name.setText(config.get('collection_name', 'AI Recommended'))
+                    self.auto_collect_threshold.setText(config.get('auto_collect_threshold', '')) 
+                print("Configuration loaded successfully!")
+            else:
+                print("Configuration file not found.")
+        except json.JSONDecodeError as e:
+            print(f"Error parsing configuration file: {e}")
+        except Exception as e:
+            print(f"Error loading configuration: {e}")
+
 
 
            
