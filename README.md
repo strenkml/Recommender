@@ -63,15 +63,15 @@ All recommendation logic, learning, and data storage happens locally in the app.
 5. Start rating content!
 
 #### MacOS
-1. Download the latest MacOS release, or install from source:
+1. Download the latest source release.
 ```bash
 # Install dependencies
-brew install python@3.8
+brew install python@3.11
 brew install sqlite3
 
 # Clone repository
-git clone https://github.com/yourusername/recommend-for-plex.git
-cd recommend-for-plex
+git clone https://github.com/gorgarp/recommender.git
+cd recommender
 
 # Create virtual environment
 python3 -m venv venv
@@ -89,14 +89,14 @@ python main.py
 ```bash
 # Ubuntu/Debian
 sudo apt-get update
-sudo apt-get install python3.8 python3-pip python3-venv sqlite3 python3-pyqt6
+sudo apt-get install python3.11 python3-pip python3-venv sqlite3 python3-pyqt6
 
 # Fedora
-sudo dnf install python3.8 python3-pip python3-virtualenv sqlite python3-pyqt6
+sudo dnf install python3.11 python3-pip python3-virtualenv sqlite python3-pyqt6
 
 # Clone repository
-git clone https://github.com/yourusername/recommend-for-plex.git
-cd recommend-for-plex
+git clone https://github.com/gorgarp/recommender.git
+cd recommender
 
 # Create virtual environment
 python3 -m venv venv
