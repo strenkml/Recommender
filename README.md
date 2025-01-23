@@ -113,7 +113,7 @@ python main.py
 1. In the Configuration tab:
    - Enter your Plex URL (e.g., http://localhost:32400)
    - Add your Plex token
-   - Add your TVDB and TMDB API keys
+   - Add your TVDB and TMDB API keys (Use the read only token for TMDB)
 2. Click "Save Configuration"
 3. Click "Load Libraries" to see your Plex libraries
 4. Select which libraries to include
