@@ -1,4 +1,4 @@
-# Recommend For Plex
+# Recommender
 
 A sophisticated AI-powered recommendation system that integrates with Plex, TMDB, and TVDB to provide personalized movie and TV show recommendations. Built with PySide6 for the GUI and leveraging PyTorch for neural networks, it incorporates multiple recommendation strategies including content-based filtering, collaborative filtering, and knowledge graphs.
 
