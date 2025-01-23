@@ -4,6 +4,7 @@ import os
 import contextlib
 import re
 import sqlite3
+import ssl
 import torch
 import requests
 import json
@@ -27,6 +28,7 @@ from torch_geometric.nn import GCNConv, GATConv, GraphSAGE
 import nltk
 from sentence_transformers import SentenceTransformer
 import shiboken6
+
 
 
 from PySide6.QtWidgets import (
@@ -608,12 +610,16 @@ class TMDBClient:
     async def _initialize_session(self) -> None:
         if self.session is None or self.session.closed:
             timeout = ClientTimeout(total=30, connect=10, sock_read=10)
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
             self.session = aiohttp.ClientSession(
                 timeout=timeout,
                 connector=aiohttp.TCPConnector(
                     limit=10,
                     force_close=True,
-                    enable_cleanup_closed=True
+                    enable_cleanup_closed=True,
+                    ssl=ssl_context
                 )
             )
 
@@ -5478,30 +5484,37 @@ class MediaScanner:
         progress_callback.emit(summary_msg)
 
     async def _fetch_metadata(self, item: Any, media_type: str) -> Optional[Dict[str, Any]]:
-        metadata = None
-
-        
-        try:
-            metadata = await self.fetch_tmdb_metadata(item.title, getattr(item, 'year', None), media_type)
-            if metadata:
-                self.logger.info(f"TMDB match found for {item.title}")
-        except Exception as e:
-            self.logger.error(f"TMDB fetch failed for {item.title}: {str(e)}")
-
-        
-        if not metadata and media_type == 'show':
+        if media_type == 'show':
             try:
                 tvdb_id = self._extract_tvdb_id(item) or await self._guess_tvdb_id(item.title)
                 if not tvdb_id:
                     self.logger.warning(f"Cannot fetch TVDB metadata for {item.title}, no ID found")
-                else:
-                    metadata = await self.tvdb_client.fetch_series_data(tvdb_id)
-                    if metadata:
-                        self.logger.info(f"TVDB match found for {item.title}")
+                    return None
+                
+                metadata = await self.tvdb_client.fetch_series_data(tvdb_id)
+                if metadata:
+                    self.logger.info(f"TVDB match found for {item.title}")
+                    return metadata
+                
+                self.logger.warning(f"No TVDB metadata found for {item.title}")
+                return None
+                
             except Exception as e:
                 self.logger.error(f"TVDB fetch failed for {item.title}: {str(e)}")
+                return None
 
-        return metadata
+        try:
+            metadata = await self.fetch_tmdb_metadata(item.title, getattr(item, 'year', None), media_type)
+            if metadata:
+                self.logger.info(f"TMDB match found for {item.title}")
+                return metadata
+            
+            self.logger.warning(f"No TMDB metadata found for {item.title}")
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"TMDB fetch failed for {item.title}: {str(e)}")
+            return None
 
     async def fetch_tvdb_metadata(self, item: Any) -> Optional[Dict[str, Any]]:
         if not self.tvdb_client:
