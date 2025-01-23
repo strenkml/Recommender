@@ -427,11 +427,16 @@ class TVDBClient(APIClient):
     async def ensure_token(self):
         with self.token_lock:
             try:
+                ssl_context = ssl.create_default_context()
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
+                
                 async with aiohttp.ClientSession() as session:
                     async with session.post(
                         f"{self.base_url}/login",
                         json={"apikey": self.api_key},
-                        timeout=10
+                        timeout=10,
+                        ssl=ssl_context
                     ) as response:
                         if response.status != 200:
                             raise ValueError(f"TVDB authentication failed: {await response.text()}")
@@ -439,7 +444,6 @@ class TVDBClient(APIClient):
                         self.token = data.get('data', {}).get('token')
                         if not self.token:
                             raise ValueError("No authentication token received")
-                       
                         self.session.headers.update({
                             "Authorization": f"Bearer {self.token}"
                         })
@@ -450,12 +454,16 @@ class TVDBClient(APIClient):
     async def search(self, title: str) -> Optional[List[Dict[str, Any]]]:
         await self.ensure_token()
         try:
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            
             async with aiohttp.ClientSession() as session:
                 url = f"{self.base_url}/search"
                 params = {"query": title, "type": "series"}
                 headers = {"Authorization": f"Bearer {self.token}"}
                
-                async with session.get(url, params=params, headers=headers) as response:
+                async with session.get(url, params=params, headers=headers, ssl=ssl_context) as response:
                     if response.status == 200:
                         data = await response.json()
                         return data.get("data", [])
@@ -468,6 +476,10 @@ class TVDBClient(APIClient):
         tvdb_id = tvdb_id.replace('series-', '')
         await self.ensure_token()
         try:
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            
             async with aiohttp.ClientSession() as session:
                 headers = {"Authorization": f"Bearer {self.token}"}
                
@@ -475,20 +487,20 @@ class TVDBClient(APIClient):
                     raise ValueError(f"Invalid TVDB ID format: {tvdb_id}")
 
                 series_url = f"{self.base_url}/series/{tvdb_id}/extended"
-                async with session.get(series_url, headers=headers) as response:
+                async with session.get(series_url, headers=headers, ssl=ssl_context) as response:
                     if response.status != 200:
                         raise ValueError(f"Failed to fetch series data: {response.status}")
                     series_data = await response.json()
                    
                 episodes_url = f"{self.base_url}/series/{tvdb_id}/episodes/default"
-                async with session.get(episodes_url, headers=headers) as response:
+                async with session.get(episodes_url, headers=headers, ssl=ssl_context) as response:
                     if response.status == 200:
                         episodes_data = await response.json()
                     else:
                         episodes_data = {"data": []}
                        
                 artwork_url = f"{self.base_url}/series/{tvdb_id}/artworks"
-                async with session.get(artwork_url, headers=headers) as response:
+                async with session.get(artwork_url, headers=headers, ssl=ssl_context) as response:
                     if response.status == 200:
                         artwork_data = await response.json()
                     else:
@@ -518,11 +530,15 @@ class TVDBClient(APIClient):
     async def fetch_episode_data(self, episode_id: str) -> Optional[Dict]:
         await self.ensure_token()
         try:
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            
             async with aiohttp.ClientSession() as session:
                 url = f"{self.base_url}/episodes/{episode_id}/extended"
                 headers = {"Authorization": f"Bearer {self.token}"}
                
-                async with session.get(url, headers=headers) as response:
+                async with session.get(url, headers=headers, ssl=ssl_context) as response:
                     if response.status == 200:
                         data = await response.json()
                         return data.get("data")
@@ -534,11 +550,15 @@ class TVDBClient(APIClient):
     async def fetch_artwork(self, series_id: str) -> Optional[List[Dict]]:
         await self.ensure_token()
         try:
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            
             async with aiohttp.ClientSession() as session:
                 url = f"{self.base_url}/series/{series_id}/artworks"
                 headers = {"Authorization": f"Bearer {self.token}"}
                
-                async with session.get(url, headers=headers) as response:
+                async with session.get(url, headers=headers, ssl=ssl_context) as response:
                     if response.status == 200:
                         data = await response.json()
                         return data.get("data", [])
@@ -550,11 +570,15 @@ class TVDBClient(APIClient):
     async def fetch_translations(self, series_id: str, language: str) -> Optional[Dict]:
         await self.ensure_token()
         try:
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            
             async with aiohttp.ClientSession() as session:
                 url = f"{self.base_url}/series/{series_id}/translations/{language}"
                 headers = {"Authorization": f"Bearer {self.token}"}
                
-                async with session.get(url, headers=headers) as response:
+                async with session.get(url, headers=headers, ssl=ssl_context) as response:
                     if response.status == 200:
                         data = await response.json()
                         return data.get("data")
@@ -1317,14 +1341,11 @@ class MediaRecommenderApp(QMainWindow):
         rating_container = QHBoxLayout()
         rating_container.addStretch(1)
         
-        rating_container = QHBoxLayout()
-        rating_container.addStretch(1)
-
         back_button = QPushButton("Back")
         back_button.setFixedWidth(100)
         back_button.clicked.connect(lambda: self.show_previous_item(media_type))
         rating_container.addWidget(back_button)
-            
+        
         rating_label = QLabel("Rate:")
         rating_label.setStyleSheet("font-size: 14px; font-weight: bold;")
         rating_container.addWidget(rating_label)
@@ -2010,7 +2031,6 @@ class MediaRecommenderApp(QMainWindow):
 
     def display_item(self, item: Optional[Dict], media_type: str) -> None:
         print(f"\nAttempting to display item for {media_type}")
-        
         widgets = self.media_widgets[media_type]
         
         if self.current_items[media_type] is not None:
@@ -2038,7 +2058,20 @@ class MediaRecommenderApp(QMainWindow):
             
             year = item.get('year', '')
             runtime = item.get('runtime', '')
-            runtime_str = f"{int(runtime) // 60} min" if str(runtime).isdigit() else runtime
+            runtime_str = ""
+            if runtime:
+                try:
+                    minutes = int(runtime)
+                    if 0 < minutes <= 1000:
+                        hours = minutes // 60
+                        mins = minutes % 60
+                        if hours > 0:
+                            runtime_str = f"{hours}h {mins}m" if mins > 0 else f"{hours}h"
+                        else:
+                            runtime_str = f"{mins}m"
+                except (ValueError, TypeError):
+                    runtime_str = ""
+            
             year_runtime = ' | '.join(filter(None, [str(year), runtime_str]))
             widgets['year_runtime_label'].setText(year_runtime)
 
@@ -5712,60 +5745,85 @@ class MediaScanner:
 
     async def _process_item(self, item: Any, metadata: Dict[str, Any], media_type: str) -> Optional[tuple]:
         try:
-            
-            def safe_json_dumps(value):
-                if isinstance(value, (dict, list)):
-                    return json.dumps(value)
-                return value
+            def format_runtime(runtime_value):
+                if not runtime_value:
+                    return ""
+                if isinstance(runtime_value, str):
+                    runtime_value = ''.join(filter(str.isdigit, runtime_value))
+                    try:
+                        runtime_value = int(runtime_value)
+                    except ValueError:
+                        return ""
+                try:
+                    runtime_value = int(runtime_value)
+                except (TypeError, ValueError):
+                    return ""
+                    
+                if runtime_value > 1000000:
+                    runtime_value = runtime_value // 60000
+                elif runtime_value > 50000:  
+                    runtime_value = runtime_value // 60
+                elif runtime_value > 1000: 
+                    factor = len(str(runtime_value)) - 2 
+                    runtime_value = runtime_value // (10 ** factor)
+                    
+                if runtime_value <= 0 or runtime_value > 1000:
+                    return ""
+                    
+                return str(runtime_value)
 
+            raw_duration = getattr(item, 'duration', None)
+            metadata_runtime = metadata.get('runtime', None)
             
-            def safe_str(value):
-                if isinstance(value, dict):
-                    return str(value.get('name', '')) or str(value.get('title', '')) or ''
-                return str(value) if value is not None else ''
+            if metadata_runtime:
+                processed_runtime = format_runtime(metadata_runtime)
+            elif raw_duration:
+                processed_runtime = format_runtime(raw_duration)
+            else:
+                processed_runtime = ""
 
-            
             return (
-                safe_str(item.title),                                     
-                media_type,                                              
-                getattr(item, 'year', None),                            
-                str(getattr(item, 'duration', '')),                     
-                
-                safe_str(metadata.get('overview')) or 
-                safe_str(metadata.get('summary')) or 
-                safe_str(getattr(item, 'summary', '')),                 
-                safe_json_dumps(metadata.get('genres', [])),            
-                safe_str(getattr(item, 'thumb', '')),                   
-                safe_str(metadata.get('id')),                           
-                safe_str(metadata.get('tmdb_id')),                      
-                safe_str(metadata.get('original_title')),               
-                safe_str(metadata.get('overview')),                     
-                float(metadata.get('popularity', 0)),                   
-                float(metadata.get('vote_average', 0)),                 
-                int(metadata.get('vote_count', 0)),                     
-                safe_str(metadata.get('status')),                       
-                safe_str(metadata.get('tagline')),                      
-                safe_str(metadata.get('backdrop_path')),                
-                safe_str(metadata.get('release_date')) or 
-                safe_str(metadata.get('first_air_date')),              
-                safe_str(metadata.get('content_rating')),               
-                safe_str(metadata.get('network')),                      
-                safe_json_dumps(metadata.get('credits')),               
-                safe_json_dumps(metadata.get('keywords')),              
-                safe_json_dumps(metadata.get('videos')),                
-                safe_str(metadata.get('language')),                     
-                safe_json_dumps(metadata.get('production_companies')),  
-                safe_json_dumps(metadata.get('reviews')),               
-                safe_json_dumps(metadata.get('episodes')),              
-                int(metadata.get('season_count', 0) or 0),             
-                int(metadata.get('episode_count', 0) or 0),            
-                safe_str(metadata.get('first_air_date')),              
-                safe_str(metadata.get('last_air_date'))                
+                str(item.title),
+                media_type,
+                getattr(item, 'year', None),
+                processed_runtime,
+                str(metadata.get('overview')) or str(metadata.get('summary')) or str(getattr(item, 'summary', '')),
+                self._safe_json_dumps(metadata.get('genres', [])),
+                str(getattr(item, 'thumb', '')),
+                str(metadata.get('id')),
+                str(metadata.get('tmdb_id')),
+                str(metadata.get('original_title')),
+                str(metadata.get('overview')),
+                float(metadata.get('popularity', 0)),
+                float(metadata.get('vote_average', 0)),
+                int(metadata.get('vote_count', 0)),
+                str(metadata.get('status')),
+                str(metadata.get('tagline')),
+                str(metadata.get('backdrop_path')),
+                str(metadata.get('release_date')) or str(metadata.get('first_air_date')),
+                str(metadata.get('content_rating')),
+                str(metadata.get('network')),
+                self._safe_json_dumps(metadata.get('credits')),
+                self._safe_json_dumps(metadata.get('keywords')),
+                self._safe_json_dumps(metadata.get('videos')),
+                str(metadata.get('language')),
+                self._safe_json_dumps(metadata.get('production_companies')),
+                self._safe_json_dumps(metadata.get('reviews')),
+                self._safe_json_dumps(metadata.get('episodes')),
+                int(metadata.get('season_count', 0) or 0),
+                int(metadata.get('episode_count', 0) or 0),
+                str(metadata.get('first_air_date')),
+                str(metadata.get('last_air_date'))
             )
         except Exception as e:
             self.logger.error(f"Error processing item {item.title}: {str(e)}")
             return None
 
+    def _safe_json_dumps(self, value):
+        if isinstance(value, (dict, list)):
+            return json.dumps(value)
+        return str(value)
+        
     async def _commit_items(self, cursor: Any, items: List[tuple]) -> None:
         try:
             cursor.execute('BEGIN')
