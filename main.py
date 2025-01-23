@@ -67,7 +67,7 @@ class Database:
 
     def _connect(self):
         try:
-            self.conn = sqlite3.connect('recommend_for_plex.db', check_same_thread=False)
+            self.conn = sqlite3.connect('recommender.db', check_same_thread=False)
         except sqlite3.Error as e:
             self.logger.error(f"Database connection error: {e}")
             raise
@@ -1071,7 +1071,7 @@ class CleanupWorker(QObject):
 class MediaRecommenderApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Recommend For Plex")
+        self.setWindowTitle("Recommender")
         self.setMinimumSize(1200, 800)
         
         self.db = Database.get_instance()
@@ -1079,7 +1079,7 @@ class MediaRecommenderApp(QMainWindow):
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logging.INFO)
         temp_dir = tempfile.gettempdir()
-        log_file_path = os.path.join(temp_dir, 'recommend_for_plex.log')
+        log_file_path = os.path.join(temp_dir, 'recommender.log')
         log_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         log_handler = RotatingFileHandler(log_file_path, maxBytes=10*1024*1024, backupCount=5)
         log_handler.setFormatter(log_formatter)
@@ -1201,7 +1201,7 @@ class MediaRecommenderApp(QMainWindow):
         QTimer.singleShot(24 * 60 * 60 * 1000, self.schedule_cache_updates)
                        
     def init_ui(self):
-        self.setWindowTitle("Recommend For Plex")
+        self.setWindowTitle("Recommender")
         self.setMinimumSize(1200, 800)
         
         self.tabs = QTabWidget()
