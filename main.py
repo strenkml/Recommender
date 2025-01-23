@@ -1743,7 +1743,7 @@ class MediaRecommenderApp(QMainWindow):
         tmdb_help = QLabel('<a style="color: #42A5F5; font-weight: bold; text-decoration: underline;" href="https://developer.themoviedb.org/docs/getting-started">[ Get API Key ]</a>')
         tmdb_help.setOpenExternalLinks(True)
         tmdb_layout.addWidget(tmdb_help)
-        api_layout.addRow("TMDB API Key:", tmdb_layout)
+        api_layout.addRow("TMDB API Read Access Token:", tmdb_layout)
         
         api_group.setLayout(api_layout)
         layout.addWidget(api_group)
