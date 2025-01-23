@@ -92,8 +92,8 @@ A sophisticated AI-powered recommendation system that integrates with Plex, TMDB
 ### Manual Installation
 1. Clone repository:
 ```bash
-git clone https://github.com/yourusername/recommend-for-plex.git
-cd recommend-for-plex
+git clone https://github.com/yourusername/Recommender.git
+cd Recommender
 ```
 
 2. Install dependencies:
