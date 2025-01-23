@@ -12,6 +12,7 @@ Get personalized movie and TV show recommendations based on your Plex libraries 
 ![image](https://github.com/user-attachments/assets/98be5b16-5870-420f-aace-2f1c8a19bef5)
 
 
+
 ## What Does It Do?
 
 - Shows you movies and TV shows you might like based on your ratings
@@ -19,6 +20,14 @@ Get personalized movie and TV show recommendations based on your Plex libraries 
 - Adds recommendations to your Plex watchlist
 - Creates and manages Plex collections
 - Works with your existing Plex libraries
+
+The app runs completely independently of your Plex server. It only interacts with Plex to:
+- Read your library contents during initial scan
+- Add items to your watchlist when requested
+- Create/modify collections when requested
+- Fetch poster images for display
+
+All recommendation logic, learning, and data storage happens locally in the app. Your Plex server is never modified without explicit actions from you.
 
 ## Features
 
@@ -45,11 +54,60 @@ Get personalized movie and TV show recommendations based on your Plex libraries 
 3. Your [Plex token](https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/)
 
 ### Installation
-1. Download the latest release
-2. Run the program
+
+#### Windows
+1. Download the latest Windows release
+2. Run the executable
 3. Enter your Plex and API information
 4. Select which libraries to use
 5. Start rating content!
+
+#### MacOS
+1. Download the latest MacOS release, or install from source:
+```bash
+# Install dependencies
+brew install python@3.8
+brew install sqlite3
+
+# Clone repository
+git clone https://github.com/yourusername/recommend-for-plex.git
+cd recommend-for-plex
+
+# Create virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# Install requirements
+pip install -r requirements.txt
+
+# Run the application
+python main.py
+```
+
+#### Linux
+1. Install dependencies:
+```bash
+# Ubuntu/Debian
+sudo apt-get update
+sudo apt-get install python3.8 python3-pip python3-venv sqlite3 python3-pyqt6
+
+# Fedora
+sudo dnf install python3.8 python3-pip python3-virtualenv sqlite python3-pyqt6
+
+# Clone repository
+git clone https://github.com/yourusername/recommend-for-plex.git
+cd recommend-for-plex
+
+# Create virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# Install requirements
+pip install -r requirements.txt
+
+# Run the application
+python main.py
+```
 
 ### First-Time Setup
 1. In the Configuration tab:
@@ -102,5 +160,6 @@ Get personalized movie and TV show recommendations based on your Plex libraries 
    - Check error messages in Configuration tab
    - Try rescanning libraries
 
+
 ## License
-GPL v3 - See [LICENSE](LICENSE) file for details
+This project is under the GPLv3 License - see [LICENSE](LICENSE) file.
