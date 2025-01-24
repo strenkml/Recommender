@@ -1,5 +1,7 @@
 FROM ghcr.io/linuxserver/baseimage-kasmvnc:ubuntujammy
 
+ENV TITLE="Recommender"
+
 WORKDIR /app
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -23,4 +25,6 @@ COPY main.py main.py
 
 RUN mkdir data
 
-CMD ["python", "main.py"]
+COPY root/ /
+
+CMD ["tail", "-f", "/dev/null"]
